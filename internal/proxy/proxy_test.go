@@ -15,6 +15,7 @@ import (
 	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
+	"github.com/chinmay28/hole-balancer/internal/stats"
 	"github.com/chinmay28/hole-balancer/internal/testdns"
 )
 
@@ -58,7 +59,7 @@ func newTestServer(t *testing.T, tune func(*config.Config), upstreams ...*testdn
 
 	log := discardLogger()
 	tracker := fallback.NewTracker(&cfg, log)
-	return New(&cfg, p, m, fallback.NewResolver(&cfg, tracker, m, log), log), p, m
+	return New(&cfg, p, m, fallback.NewResolver(&cfg, tracker, m, log), stats.New(), log), p, m
 }
 
 func mustQuery(t *testing.T, name string) []byte {

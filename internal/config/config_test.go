@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -241,5 +243,189 @@ func TestUnnamedUpstreamsGetNames(t *testing.T) {
 	}
 	if cfg.Upstreams[0].Name != "upstream-1" || cfg.Upstreams[1].Name != "upstream-2" {
 		t.Errorf("generated names = %q, %q", cfg.Upstreams[0].Name, cfg.Upstreams[1].Name)
+	}
+}
+
+// A config the balancer writes must survive its own restart. The duration
+// fields are the trap: written as a raw integer they would read back as that
+// many seconds.
+func TestSaveReloadsIdentically(t *testing.T) {
+	orig, err := Parse([]byte(`
+strategy: least-latency
+query:
+  timeout: 1500ms
+health:
+  interval: 45s
+  probe: {name: pi.hole, type: AAAA}
+fallback:
+  servers: [1.1.1.1, 9.9.9.9:5353]
+  summary_interval: 12h
+upstreams:
+  - name: a
+    weight: 3
+    endpoints: [192.168.1.10, "[fd00::1]:5353"]
+  - name: b
+    endpoints: [192.168.1.11]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := orig.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	back, err := Load(path)
+	if err != nil {
+		t.Fatalf("saved config does not reload: %v", err)
+	}
+
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"strategy", back.Strategy, orig.Strategy},
+		{"query.timeout", back.Query.Timeout, orig.Query.Timeout},
+		{"health.interval", back.Health.Interval, orig.Health.Interval},
+		{"probe.name", back.Health.Probe.Name, orig.Health.Probe.Name},
+		{"probe.type", back.Health.Probe.QType(), orig.Health.Probe.QType()},
+		{"summary_interval", back.Fallback.SummaryInterval, orig.Fallback.SummaryInterval},
+		{"upstream count", len(back.Upstreams), len(orig.Upstreams)},
+		{"weight", back.Upstreams[0].Weight, orig.Upstreams[0].Weight},
+		{"endpoint", back.Upstreams[0].Endpoints[1].Addr, orig.Upstreams[0].Endpoints[1].Addr},
+		{"fallback server", back.Fallback.Servers[1], orig.Fallback.Servers[1]},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v after a save/load round trip, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+func TestSaveIsAtomicAndKeepsABackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	first, _ := Parse([]byte(minimal))
+	if err := first.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Error("the first save should not leave a backup: there was nothing to back up")
+	}
+
+	second := first.Clone()
+	second.Strategy = StrategyFailover
+	if err := second.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	prev, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("no backup after the second save: %v", err)
+	}
+	if !strings.Contains(string(prev), "strategy: random") {
+		t.Errorf("backup does not hold the previous version:\n%s", prev)
+	}
+
+	// The temporary file used for the atomic rename must not be left behind.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".hole-balancer-config-") {
+			t.Errorf("a temporary file was left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestSaveReportsAnUnwritableDirectory(t *testing.T) {
+	cfg, _ := Parse([]byte(minimal))
+	if err := cfg.Save(filepath.Join(t.TempDir(), "no", "such", "dir", "c.yaml")); err == nil {
+		t.Error("Save should fail when the directory does not exist")
+	}
+}
+
+func TestCloneIsDeep(t *testing.T) {
+	orig, err := Parse([]byte("fallback:\n  servers: [1.1.1.1]\n" + minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clone := orig.Clone()
+	clone.Upstreams[0].Name = "changed"
+	clone.Upstreams[0].Endpoints[0].Addr = "9.9.9.9:53"
+	clone.Fallback.Servers[0] = "6.6.6.6:53"
+	clone.Query.RetryRCodes[0] = "NXDOMAIN"
+
+	if orig.Upstreams[0].Name == "changed" ||
+		orig.Upstreams[0].Endpoints[0].Addr == "9.9.9.9:53" ||
+		orig.Fallback.Servers[0] == "6.6.6.6:53" ||
+		orig.Query.RetryRCodes[0] == "NXDOMAIN" {
+		t.Error("Clone shares state with the original")
+	}
+	// The derived lookup table must come across, or a clone silently stops
+	// retrying.
+	if !clone.Query.ShouldRetryRCode(dnsmsg.RCodeServFail) {
+		t.Error("clone lost its parsed retry codes")
+	}
+}
+
+func TestPrepareUpstream(t *testing.T) {
+	got, err := PrepareUpstream(Upstream{
+		Name:      "  pihole-1  ",
+		Endpoints: []Endpoint{{Addr: "192.168.1.10"}, {Name: "ts", Addr: "100.64.0.5:5353"}},
+	})
+	if err != nil {
+		t.Fatalf("PrepareUpstream: %v", err)
+	}
+	if got.Name != "pihole-1" {
+		t.Errorf("name = %q, want it trimmed", got.Name)
+	}
+	if got.Weight != 1 {
+		t.Errorf("weight = %d, want the default 1", got.Weight)
+	}
+	if got.Endpoints[0].Addr != "192.168.1.10:53" || got.Endpoints[0].Name != "192.168.1.10:53" {
+		t.Errorf("endpoint 0 = %+v", got.Endpoints[0])
+	}
+	if got.Endpoints[1].Name != "ts" {
+		t.Errorf("an explicit label should be kept, got %q", got.Endpoints[1].Name)
+	}
+}
+
+func TestPrepareUpstreamRejections(t *testing.T) {
+	cases := map[string]Upstream{
+		"empty name":        {Endpoints: []Endpoint{{Addr: "1.2.3.4"}}},
+		"blank name":        {Name: "   ", Endpoints: []Endpoint{{Addr: "1.2.3.4"}}},
+		"slash in name":     {Name: "a/b", Endpoints: []Endpoint{{Addr: "1.2.3.4"}}},
+		"no endpoints":      {Name: "a"},
+		"negative weight":   {Name: "a", Weight: -1, Endpoints: []Endpoint{{Addr: "1.2.3.4"}}},
+		"bad address":       {Name: "a", Endpoints: []Endpoint{{Addr: "not:a:host"}}},
+		"repeated endpoint": {Name: "a", Endpoints: []Endpoint{{Addr: "1.2.3.4"}, {Addr: "1.2.3.4:53"}}},
+	}
+	for name, u := range cases {
+		if _, err := PrepareUpstream(u); err == nil {
+			t.Errorf("%s: PrepareUpstream succeeded, want an error", name)
+		}
+	}
+}
+
+func TestStrategyHelpers(t *testing.T) {
+	if !ValidStrategy(StrategyLeastLatency) || ValidStrategy("sticky") {
+		t.Error("ValidStrategy is wrong")
+	}
+	if len(Strategies()) != 4 {
+		t.Errorf("Strategies() = %v", Strategies())
+	}
+	// The returned slice must be a copy, or a caller could corrupt the list.
+	Strategies()[0] = "mutated"
+	if Strategies()[0] == "mutated" {
+		t.Error("Strategies() hands out the package-level slice")
+	}
+}
+
+func TestNormaliseAddrIsExported(t *testing.T) {
+	got, err := NormaliseAddr("192.168.1.10")
+	if err != nil || got != "192.168.1.10:53" {
+		t.Errorf("NormaliseAddr = %q, %v", got, err)
 	}
 }

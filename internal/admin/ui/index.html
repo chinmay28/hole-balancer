@@ -1,0 +1,147 @@
+<div class="viz-root">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>hole-balancer</h1>
+        <p class="sub" id="version">loading…</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="pill" id="health-pill"><span class="dot" aria-hidden="true"></span><span id="health-text">…</span></div>
+      <button type="button" id="theme-toggle" class="btn ghost" aria-label="Switch between light and dark theme">Theme</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <main>
+    <!-- ---------------------------------------------------------------- -->
+    <section aria-labelledby="h-overview">
+      <h2 id="h-overview" class="sr-only">Overview</h2>
+      <div class="tiles" id="tiles"></div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" aria-labelledby="h-traffic">
+      <div class="card-head">
+        <div>
+          <h2 id="h-traffic">Queries over time</h2>
+          <p class="sub" id="traffic-sub">&nbsp;</p>
+        </div>
+        <div class="seg" role="group" aria-label="Time range">
+          <button type="button" class="seg-btn is-on" data-range="hour">Last hour</button>
+          <button type="button" class="seg-btn" data-range="day">Last 24h</button>
+        </div>
+      </div>
+      <div class="chart-scroll">
+        <div id="traffic" class="traffic"></div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <div class="grid-2">
+      <section class="card" aria-labelledby="h-nodes">
+        <div class="card-head">
+          <div>
+            <h2 id="h-nodes">Queries by Pi-hole</h2>
+            <p class="sub" id="nodes-sub">&nbsp;</p>
+          </div>
+          <button type="button" class="btn ghost small" id="nodes-table-toggle" aria-expanded="false">Table</button>
+        </div>
+        <div id="node-chart" class="barlist"></div>
+        <div id="node-table" class="table-wrap" hidden></div>
+      </section>
+
+      <section class="card" aria-labelledby="h-rcodes">
+        <div class="card-head">
+          <div>
+            <h2 id="h-rcodes">Response codes</h2>
+            <p class="sub">NXDOMAIN is how Pi-hole reports a blocked domain.</p>
+          </div>
+        </div>
+        <div id="rcode-chart" class="barlist"></div>
+        <h3 class="minor">Query types</h3>
+        <div id="qtype-chart" class="barlist"></div>
+      </section>
+    </div>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" aria-labelledby="h-pool">
+      <div class="card-head">
+        <div>
+          <h2 id="h-pool">Pi-holes</h2>
+          <p class="sub">A Pi-hole reachable by more than one route is one entry with several endpoints — the first healthy one carries its traffic.</p>
+        </div>
+        <div class="head-controls">
+          <label class="field inline">
+            <span>Strategy</span>
+            <select id="strategy" class="input"></select>
+          </label>
+          <button type="button" class="btn" id="add-open">Add Pi-hole</button>
+        </div>
+      </div>
+
+      <form id="add-form" class="addform" hidden>
+        <div class="addform-grid">
+          <label class="field">
+            <span>Name</span>
+            <input class="input" id="add-name" placeholder="pihole-office" autocomplete="off" required>
+          </label>
+          <label class="field">
+            <span>Weight</span>
+            <input class="input" id="add-weight" type="number" min="1" step="1" value="1">
+          </label>
+          <label class="field wide">
+            <span>Addresses <em>— one per line; first is preferred</em></span>
+            <textarea class="input" id="add-endpoints" rows="2" placeholder="192.168.1.11&#10;100.101.102.104" autocomplete="off" required></textarea>
+          </label>
+        </div>
+        <div class="addform-actions">
+          <button type="submit" class="btn primary">Add</button>
+          <button type="button" class="btn ghost" id="add-cancel">Cancel</button>
+          <span class="hint">Port 53 is assumed unless you write one.</span>
+        </div>
+      </form>
+
+      <div id="pool" class="pool"></div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" aria-labelledby="h-fallback">
+      <div class="card-head">
+        <div>
+          <h2 id="h-fallback">Public DNS fallback</h2>
+          <p class="sub">Used only when no Pi-hole can answer. These replies are <strong>not filtered</strong>.</p>
+        </div>
+        <div id="fallback-state" class="pill quiet">…</div>
+      </div>
+
+      <form id="fallback-form">
+        <label class="switch">
+          <input type="checkbox" id="fb-enabled">
+          <span>Answer from public DNS when every Pi-hole is down</span>
+        </label>
+        <label class="field">
+          <span>Resolvers <em>— one per line, tried in rotation</em></span>
+          <textarea class="input" id="fb-servers" rows="2" placeholder="8.8.8.8&#10;8.8.4.4" autocomplete="off"></textarea>
+        </label>
+        <div class="addform-actions">
+          <button type="submit" class="btn primary">Save fallback</button>
+          <span class="hint" id="fb-hint"></span>
+        </div>
+      </form>
+    </section>
+
+    <footer class="foot">
+      <span id="foot-config"></span>
+      <span class="foot-links">
+        <a href="/summary">text summary</a> ·
+        <a href="/status">status JSON</a> ·
+        <a href="/metrics">metrics</a> ·
+        <a href="/healthz">healthz</a>
+      </span>
+    </footer>
+  </main>
+</div>

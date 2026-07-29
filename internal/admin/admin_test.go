@@ -11,12 +11,21 @@ import (
 	"time"
 
 	"github.com/chinmay28/hole-balancer/internal/config"
+	"github.com/chinmay28/hole-balancer/internal/control"
 	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
+	"github.com/chinmay28/hole-balancer/internal/stats"
 )
 
 func newTestAdmin(t *testing.T, allowControl bool) (*Server, *pool.Pool) {
+	s, p, _ := newTestAdminFull(t, allowControl, "")
+	return s, p
+}
+
+// newTestAdminFull also hands back the manager, for the tests that make
+// changes. Passing a config path makes those changes persist to that file.
+func newTestAdminFull(t *testing.T, allowControl bool, path string) (*Server, *pool.Pool, *stats.Collector) {
 	t.Helper()
 
 	cfg := config.Default()
@@ -35,7 +44,19 @@ func newTestAdmin(t *testing.T, allowControl bool) (*Server, *pool.Pool) {
 	p := pool.New(&cfg, nil)
 	m := metrics.New()
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	return New(&cfg, p, m, fallback.NewTracker(&cfg, log), log, "test"), p
+	tracker := fallback.NewTracker(&cfg, log)
+	resolver := fallback.NewResolver(&cfg, tracker, m, log)
+	collector := stats.New()
+	manager := control.New(control.Options{
+		Config: &cfg, Path: path, Pool: p, Fallback: resolver,
+		Stats: collector, Log: log, AllowWrite: allowControl,
+	})
+
+	srv := New(Options{
+		Config: &cfg, Pool: p, Metrics: m, Fallback: tracker, Resolver: resolver,
+		Stats: collector, Control: manager, Log: log, Version: "test",
+	})
+	return srv, p, collector
 }
 
 func do(t *testing.T, s *Server, method, target string) *httptest.ResponseRecorder {
@@ -152,7 +173,7 @@ func TestIndexSummary(t *testing.T) {
 	s, p := newTestAdmin(t, true)
 	p.SetInitial(p.Endpoints()[0], true, time.Millisecond, nil)
 
-	rec := do(t, s, http.MethodGet, "/")
+	rec := do(t, s, http.MethodGet, "/summary")
 	body := rec.Body.String()
 	for _, want := range []string{"hole-balancer test", "pihole-1", "pihole-2", "10.0.0.1:53", "/metrics", "POST /drain"} {
 		if !strings.Contains(body, want) {
@@ -205,13 +226,13 @@ func TestFallbackGaugeTracksPoolState(t *testing.T) {
 func TestIndexShowsFallbackState(t *testing.T) {
 	s, p := newTestAdmin(t, false)
 
-	body := do(t, s, http.MethodGet, "/").Body.String()
+	body := do(t, s, http.MethodGet, "/summary").Body.String()
 	if !strings.Contains(body, "ACTIVE - answering unfiltered") {
 		t.Errorf("an operator should see at a glance that answers are unfiltered\n---\n%s", body)
 	}
 
 	p.SetInitial(p.Endpoints()[0], true, time.Millisecond, nil)
-	body = do(t, s, http.MethodGet, "/").Body.String()
+	body = do(t, s, http.MethodGet, "/summary").Body.String()
 	if !strings.Contains(body, "standby") {
 		t.Errorf("fallback should read as standby once a Pi-hole is up\n---\n%s", body)
 	}

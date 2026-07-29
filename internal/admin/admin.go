@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/chinmay28/hole-balancer/internal/config"
+	"github.com/chinmay28/hole-balancer/internal/control"
 	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
+	"github.com/chinmay28/hole-balancer/internal/stats"
 )
 
 // Server is the HTTP admin interface.
@@ -28,15 +30,48 @@ type Server struct {
 	started time.Time
 
 	fallback *fallback.Tracker
+	resolver *fallback.Resolver
+	stats    *stats.Collector
+	control  *control.Manager
+	// probe, when set, runs an immediate health sweep. The interface uses it so
+	// a Pi-hole added by hand shows its true state at once instead of looking
+	// down until the next scheduled sweep.
+	probe func()
+}
+
+// Options collects the server's dependencies.
+type Options struct {
+	Config   *config.Config
+	Pool     *pool.Pool
+	Metrics  *metrics.Metrics
+	Fallback *fallback.Tracker
+	Resolver *fallback.Resolver
+	Stats    *stats.Collector
+	Control  *control.Manager
+	Log      *slog.Logger
+	Version  string
+	ProbeNow func()
 }
 
 // New creates the admin server.
-func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, fb *fallback.Tracker, log *slog.Logger, version string) *Server {
+func New(opts Options) *Server {
 	return &Server{
-		cfg: cfg, pool: p, metrics: m, fallback: fb,
-		log: log, version: version, started: time.Now(),
+		cfg:      opts.Config,
+		pool:     opts.Pool,
+		metrics:  opts.Metrics,
+		fallback: opts.Fallback,
+		resolver: opts.Resolver,
+		stats:    opts.Stats,
+		control:  opts.Control,
+		log:      opts.Log,
+		version:  opts.Version,
+		probe:    opts.ProbeNow,
+		started:  time.Now(),
 	}
 }
+
+// uptime is how long this server has been answering.
+func (s *Server) uptime() time.Duration { return time.Since(s.started) }
 
 // Handler builds the admin route table.
 func (s *Server) Handler() http.Handler {
@@ -44,7 +79,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("GET /{$}", s.handleIndex)
+	mux.HandleFunc("GET /summary", s.handleIndex)
+	mux.HandleFunc("GET /{$}", s.handleUI)
+	s.apiRoutes(mux)
 	if s.cfg.Admin.AllowControl {
 		mux.HandleFunc("POST /drain", s.handleDrain(true))
 		mux.HandleFunc("POST /undrain", s.handleDrain(false))
@@ -126,7 +163,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	resp := statusResponse{
 		Version:   s.version,
 		UptimeSec: time.Since(s.started).Seconds(),
-		Strategy:  s.cfg.Strategy,
+		Strategy:  s.pool.Strategy(),
 		Healthy:   s.pool.HealthyUpstreams(),
 		Total:     len(s.pool.Upstreams()),
 		Fallback:  s.fallbackStatus(),
@@ -141,10 +178,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) fallbackStatus() fallbackStatus {
+	// Read the live resolver rather than the startup configuration: the
+	// management interface can change this while the process runs.
+	servers := s.resolver.Servers()
+	enabled := len(servers) > 0
 	fs := fallbackStatus{
-		Enabled: s.cfg.Fallback.Enabled,
-		Active:  s.cfg.Fallback.Enabled && s.pool.HealthyUpstreams() == 0,
-		Servers: s.cfg.Fallback.Servers,
+		Enabled: enabled,
+		Active:  enabled && s.pool.HealthyUpstreams() == 0,
+		Servers: servers,
 	}
 	if s.fallback != nil {
 		snap := s.fallback.Snapshot()
@@ -254,7 +295,7 @@ func (s *Server) handleDrain(drain bool) http.HandlerFunc {
 func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintf(w, "hole-balancer %s\n\n", s.version)
-	fmt.Fprintf(w, "strategy: %s\n", s.cfg.Strategy)
+	fmt.Fprintf(w, "strategy: %s\n", s.pool.Strategy())
 	fmt.Fprintf(w, "upstreams: %d healthy of %d\n\n", s.pool.HealthyUpstreams(), len(s.pool.Upstreams()))
 	for _, u := range s.pool.Status() {
 		state := "DOWN"
@@ -296,7 +337,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 				fs.Queries, fs.Outages, fs.Since)
 		}
 	}
-	fmt.Fprint(w, "\nendpoints: /healthz  /status  /metrics\n")
+	fmt.Fprint(w, "\nendpoints: /  (dashboard)  /summary  /healthz  /status  /metrics\n")
 	if s.cfg.Admin.AllowControl {
 		fmt.Fprint(w, "control:   POST /drain?upstream=NAME  POST /undrain?upstream=NAME\n")
 	}

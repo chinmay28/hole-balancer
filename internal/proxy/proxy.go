@@ -15,6 +15,7 @@ import (
 	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
+	"github.com/chinmay28/hole-balancer/internal/stats"
 )
 
 // Server forwards client queries to upstream Pi-holes.
@@ -24,6 +25,7 @@ type Server struct {
 	metrics  *metrics.Metrics
 	log      *slog.Logger
 	fallback *fallback.Resolver
+	stats    *stats.Collector
 
 	// sem bounds queries in flight across both transports.
 	sem chan struct{}
@@ -42,13 +44,14 @@ const outageProbeAttempts = 1
 
 // New creates a forwarding server. A nil fallback resolver simply means no
 // public-DNS last resort.
-func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, fb *fallback.Resolver, log *slog.Logger) *Server {
+func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, fb *fallback.Resolver, st *stats.Collector, log *slog.Logger) *Server {
 	return &Server{
 		cfg:      cfg,
 		pool:     p,
 		metrics:  m,
 		log:      log,
 		fallback: fb,
+		stats:    st,
 		sem:      make(chan struct{}, cfg.Query.MaxConcurrent),
 		ready:    make(chan struct{}),
 	}
@@ -111,6 +114,13 @@ func (s *Server) Resolve(ctx context.Context, req []byte, proto string) []byte {
 func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 	question, qErr := dnsmsg.ParseQuestion(req)
 
+	rec := stats.Record{Proto: proto}
+	if qErr == nil {
+		rec.QType = dnsmsg.TypeString(question.Type)
+	}
+	start := time.Now()
+	defer func() { s.record(rec, start) }()
+
 	plan := s.pool.Plan()
 	attempts := s.cfg.Query.MaxAttempts
 	if attempts > len(plan) {
@@ -136,6 +146,7 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 			break
 		}
 		ep := plan[i]
+		rec.Attempts = i + 1
 		if i > 0 {
 			s.metrics.Retries.Inc(metrics.Label{Name: "reason", Value: lastReason})
 		}
@@ -180,6 +191,8 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 			metrics.Label{Name: "endpoint", Value: ep.Name},
 			metrics.Label{Name: "rcode", Value: respHdr.RCode.String()},
 		)
+		rec.Upstream, rec.Endpoint = ep.Upstream.Name, ep.Name
+		rec.RCode = respHdr.RCode.String()
 		if s.cfg.Log.Queries {
 			s.log.Info("query",
 				"question", questionField(question, qErr),
@@ -195,9 +208,10 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 		return resp
 	}
 
-	if resp := s.resolveViaFallback(ctx, req, proto, question, qErr); resp != nil {
+	if resp := s.resolveViaFallback(ctx, req, proto, question, qErr, &rec); resp != nil {
 		return resp
 	}
+	rec.Failed = true
 
 	s.metrics.Servfails.Inc()
 	s.log.Warn("query failed on every attempt",
@@ -211,8 +225,12 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 	if lastResp != nil {
 		// Prefer a real upstream error response over a synthetic one: it may
 		// carry EDNS0 information the client can use.
+		if hdr, err := dnsmsg.ParseHeader(lastResp); err == nil {
+			rec.RCode = hdr.RCode.String()
+		}
 		return lastResp
 	}
+	rec.RCode = dnsmsg.RCodeServFail.String()
 	return dnsmsg.ErrorResponse(req, dnsmsg.RCodeServFail)
 }
 
@@ -222,7 +240,7 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 // Nothing is logged per query here: during an outage that would be one line
 // per lookup for every device on the network. Usage is accumulated by the
 // tracker and reported once per summary interval instead.
-func (s *Server) resolveViaFallback(ctx context.Context, req []byte, proto string, question dnsmsg.Question, qErr error) []byte {
+func (s *Server) resolveViaFallback(ctx context.Context, req []byte, proto string, question dnsmsg.Question, qErr error, rec *stats.Record) []byte {
 	if !s.fallback.Enabled() {
 		return nil
 	}
@@ -234,8 +252,12 @@ func (s *Server) resolveViaFallback(ctx context.Context, req []byte, proto strin
 		return nil
 	}
 
+	respHdr, _ := dnsmsg.ParseHeader(resp)
+	rec.Fallback = true
+	rec.Upstream, rec.Endpoint = "", server
+	rec.RCode = respHdr.RCode.String()
+
 	if s.cfg.Log.Queries {
-		respHdr, _ := dnsmsg.ParseHeader(resp)
 		s.log.Info("query answered by public DNS fallback (unfiltered)",
 			"question", questionField(question, qErr),
 			"proto", proto,
@@ -244,6 +266,16 @@ func (s *Server) resolveViaFallback(ctx context.Context, req []byte, proto strin
 		)
 	}
 	return resp
+}
+
+// record files a completed query with the statistics collector, which is what
+// the management dashboard reads.
+func (s *Server) record(rec stats.Record, start time.Time) {
+	if s.stats == nil {
+		return
+	}
+	rec.Latency = time.Since(start)
+	s.stats.Record(rec)
 }
 
 func questionField(q dnsmsg.Question, err error) string {

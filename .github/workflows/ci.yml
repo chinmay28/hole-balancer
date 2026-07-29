@@ -38,6 +38,18 @@ jobs:
         run: |
           go run ./cmd/hole-balancer -validate -config config.example.yaml
 
+      - name: Quick start builds and produces a valid config
+        run: |
+          PORT=5399 ADMIN_PORT=8099 timeout 90 ./quickstart.sh 127.0.0.1:5301 &
+          qs=$!
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:8099/api/overview >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8099/ | grep -q "hole-balancer"
+          curl -sf http://127.0.0.1:8099/api/stats >/dev/null
+          kill $qs 2>/dev/null || true
+
       - name: Build
         run: go build ./...
 

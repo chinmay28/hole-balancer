@@ -7,9 +7,12 @@ spreads queries across every Pi-hole that is answering, and routes around the
 ones that are not — so rebooting a Pi-hole, or losing one entirely, stops being
 something the whole house notices.
 
-It is a single static binary with no runtime dependencies, and it forwards DNS
-messages **byte for byte**: EDNS0, DNSSEC, and cookies pass through exactly as
-the client and the Pi-hole intended.
+It is a single static binary with no runtime dependencies, it ships with a web
+interface for managing the pool, and it forwards DNS messages **byte for
+byte**: EDNS0, DNSSEC, and cookies pass through exactly as the client and the
+Pi-hole intended.
+
+**[→ Quick start](QUICKSTART.md)** — running in about a minute.
 
 ---
 
@@ -33,8 +36,12 @@ the client and the Pi-hole intended.
   Google's resolvers (or whichever you configure) so the network keeps working
   through a total outage. Usage is reported as one daily summary, never as a
   line per query.
-- **Reports what it is doing.** JSON status, Prometheus metrics, and a plain
-  text summary you can `curl`.
+- **Comes with a dashboard.** Add and remove Pi-holes, drain one for
+  maintenance, edit the fallback list, switch strategy, and see who is handling
+  what — no config file, no restart. Served by the balancer itself, so it loads
+  even when DNS is down.
+- **Reports what it is doing.** A web dashboard, JSON status, Prometheus
+  metrics, and a plain text summary you can `curl`.
 
 ## What it does not do
 
@@ -54,8 +61,17 @@ the client and the Pi-hole intended.
 ```bash
 git clone https://github.com/chinmay28/hole-balancer
 cd hole-balancer
-make build
+./quickstart.sh 192.168.1.10 192.168.1.11
+```
 
+That builds it, writes a config, and starts on a high port with the dashboard at
+<http://127.0.0.1:8053/>. See [QUICKSTART.md](QUICKSTART.md) for the guided
+version and how to make it permanent.
+
+Or do it by hand:
+
+```bash
+make build
 cp config.example.yaml config.yaml
 $EDITOR config.yaml          # list your Pi-holes under `upstreams`
 
@@ -77,7 +93,8 @@ Everything else has a working default. Check it is answering:
 
 ```bash
 dig @127.0.0.1 example.com
-curl -s localhost:8053/          # which Pi-hole served what
+open http://localhost:8053/      # the dashboard
+curl -s localhost:8053/summary   # or the same thing as text
 ```
 
 Then set your router's DHCP "DNS server" option to the balancer's address, or
@@ -291,13 +308,63 @@ The balancer detects this failure and says so, rather than exiting with a bare
 
 ## Operating it
 
-### Status
+### The dashboard
+
+<http://localhost:8053/> is the management interface: pool state, live
+statistics, and the controls to change any of it. It is a single self-contained
+page served from the binary — no CDN, no build step, nothing fetched over the
+network. That is deliberate: you open this page when DNS is broken.
+
+It shows total queries and the recent rate, how many Pi-holes are up, **which
+one has handled the most**, average response time, the share of queries blocked,
+how many were answered unfiltered by public DNS, a queries-over-time chart
+(hour by minute, or day by hour), a per-Pi-hole breakdown with a table view, and
+the response-code and query-type mix.
+
+With `admin.allow_control: true` it is also editable — add a Pi-hole, remove
+one, drain one before a reboot, edit the fallback resolvers, or switch strategy.
+Changes apply immediately **and** are written back to your config file, with the
+previous version kept as `<config>.bak`.
+
+Two things to know about that write-back:
+
+- **Comments are not preserved.** Once you edit through the interface the file
+  is machine-managed; keep notes elsewhere. The annotated reference always lives
+  in `config.example.yaml`.
+- **Draining is not saved.** It is a "while I work on this box" state, and a
+  Pi-hole still drained after an unrelated reboot is a trap.
+
+**There is no authentication.** Keep `admin.listen` on loopback (the default)
+unless you put something in front of it that authenticates. With
+`allow_control: false` — also the default — the interface is read-only and every
+mutating endpoint returns 403.
+
+### From the terminal
 
 ```bash
-curl -s localhost:8053/          # human-readable summary
+curl -s localhost:8053/summary   # human-readable summary
 curl -s localhost:8053/status    # the same as JSON
 curl -s localhost:8053/healthz   # 200 while any Pi-hole answers, 503 otherwise
 curl -s localhost:8053/metrics   # Prometheus
+```
+
+The management API behind the dashboard is plain JSON, so anything can drive it:
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/overview` | pool state, health, fallback, what you are allowed to change |
+| `GET /api/stats` | every statistic the dashboard shows, including history |
+| `GET /api/config` | the effective configuration |
+| `POST /api/upstreams` | add a Pi-hole — `{"name":…,"weight":1,"endpoints":[…]}` |
+| `DELETE /api/upstreams/{name}` | remove one |
+| `POST /api/upstreams/{name}/drain` | `{"drained":true}` |
+| `PUT /api/strategy` | `{"strategy":"least-latency"}` |
+| `PUT /api/fallback` | `{"enabled":true,"servers":[…]}` |
+| `POST /api/stats/reset` | clear the counters |
+
+```bash
+curl -sXPOST localhost:8053/api/upstreams \
+  -d '{"name":"pihole-attic","endpoints":["192.168.1.12","100.101.102.105"]}'
 ```
 
 ```
@@ -320,17 +387,17 @@ The `*` marks the path currently carrying traffic for that upstream.
 
 ### Draining a Pi-hole for maintenance
 
-Set `admin.allow_control: true`, then:
+Use the **Drain** button on the dashboard, or:
 
 ```bash
-curl -sXPOST 'localhost:8053/drain?upstream=pihole-office'    # stop sending it queries
+curl -sXPOST localhost:8053/api/upstreams/pihole-office/drain -d '{"drained":true}'
 # ... update, reboot, whatever ...
-curl -sXPOST 'localhost:8053/undrain?upstream=pihole-office'  # back into rotation
+curl -sXPOST localhost:8053/api/upstreams/pihole-office/drain -d '{"drained":false}'
 ```
 
-Draining takes effect immediately, so no client ever waits on a timeout. There
-is no authentication on these endpoints — keep `admin.listen` on loopback
-unless your network is one you trust.
+Draining takes effect immediately, so no client ever waits on a timeout.
+
+(The older `POST /drain?upstream=NAME` form still works.)
 
 ### Metrics worth alerting on
 
@@ -403,8 +470,10 @@ Layout:
 | `internal/pool` | Upstreams, endpoints, health state, and selection |
 | `internal/health` | Active probing |
 | `internal/fallback` | Public-DNS last resort and its daily usage summary |
+| `internal/stats` | Query statistics and the short history the dashboard charts |
+| `internal/control` | Applies dashboard changes to the running server and to disk |
 | `internal/proxy` | Listeners and the forwarding path |
-| `internal/admin` | Status, metrics, and drain endpoints |
+| `internal/admin` | Dashboard, management API, status, and metrics |
 | `internal/metrics` | Counters, histograms, Prometheus rendering |
 
 The only dependency is `gopkg.in/yaml.v3`.

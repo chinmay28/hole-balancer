@@ -3,6 +3,8 @@
 package pool
 
 import (
+	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sort"
 	"sync"
@@ -92,13 +94,20 @@ func (u *Upstream) SetDrained(v bool) { u.drained.Store(v) }
 type StateChangeFunc func(e *Endpoint, up bool, reason string)
 
 // Pool is the collection of upstreams and the selection policy over them.
+//
+// The membership and the strategy can both change while queries are in flight,
+// so that a Pi-hole can be added or removed from the management interface
+// without a restart. mu guards those two; per-endpoint health lives on the
+// endpoints themselves and is not covered by it.
 type Pool struct {
+	mu        sync.RWMutex
 	upstreams []*Upstream
 	endpoints []*Endpoint
 	strategy  string
-	rise      int
-	fall      int
-	passive   bool
+
+	rise    int
+	fall    int
+	passive bool
 
 	rr       atomic.Uint64
 	onChange StateChangeFunc
@@ -119,25 +128,129 @@ func New(cfg *config.Config, onChange StateChangeFunc) *Pool {
 		p.onChange = func(*Endpoint, bool, string) {}
 	}
 	for _, uc := range cfg.Upstreams {
-		u := &Upstream{Name: uc.Name, Weight: uc.Weight}
-		for _, ec := range uc.Endpoints {
-			e := &Endpoint{Name: ec.Name, Addr: ec.Addr, Upstream: u}
-			u.Endpoints = append(u.Endpoints, e)
-			p.endpoints = append(p.endpoints, e)
-		}
+		u := buildUpstream(uc)
 		p.upstreams = append(p.upstreams, u)
+		p.endpoints = append(p.endpoints, u.Endpoints...)
 	}
 	return p
 }
 
-// Upstreams returns the configured upstreams in configuration order.
-func (p *Pool) Upstreams() []*Upstream { return p.upstreams }
+func buildUpstream(uc config.Upstream) *Upstream {
+	u := &Upstream{Name: uc.Name, Weight: uc.Weight}
+	for _, ec := range uc.Endpoints {
+		u.Endpoints = append(u.Endpoints, &Endpoint{Name: ec.Name, Addr: ec.Addr, Upstream: u})
+	}
+	return u
+}
 
-// Endpoints returns every endpoint across every upstream.
-func (p *Pool) Endpoints() []*Endpoint { return p.endpoints }
+// Errors returned when the pool's membership cannot be changed as asked.
+var (
+	ErrDuplicateName = errors.New("pool: an upstream with that name already exists")
+	ErrNotFound      = errors.New("pool: no such upstream")
+	ErrLastUpstream  = errors.New("pool: refusing to remove the only upstream")
+)
+
+// Add brings a new Pi-hole into rotation. Its endpoints start down and are
+// picked up by the next health sweep, so a wrong address never silently
+// swallows queries — though the fail-open tier will still try it if nothing
+// else is healthy.
+func (p *Pool) Add(uc config.Upstream) (*Upstream, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, u := range p.upstreams {
+		if u.Name == uc.Name {
+			return nil, fmt.Errorf("%w: %s", ErrDuplicateName, uc.Name)
+		}
+		for _, e := range u.Endpoints {
+			for _, ec := range uc.Endpoints {
+				if e.Addr == ec.Addr {
+					return nil, fmt.Errorf("address %s is already used by upstream %q", ec.Addr, u.Name)
+				}
+			}
+		}
+	}
+
+	u := buildUpstream(uc)
+	p.upstreams = append(p.upstreams, u)
+	p.endpoints = append(p.endpoints, u.Endpoints...)
+	return u, nil
+}
+
+// Remove takes a Pi-hole out of the pool entirely.
+//
+// Removing the last one is refused: an empty pool has nothing to fail over to
+// and nothing to recover, which is a configuration mistake rather than a
+// deployment anyone wants.
+func (p *Pool) Remove(name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	idx := -1
+	for i, u := range p.upstreams {
+		if u.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("%w: %s", ErrNotFound, name)
+	}
+	if len(p.upstreams) == 1 {
+		return ErrLastUpstream
+	}
+
+	removed := p.upstreams[idx]
+	p.upstreams = append(p.upstreams[:idx:idx], p.upstreams[idx+1:]...)
+
+	kept := make([]*Endpoint, 0, len(p.endpoints))
+	for _, e := range p.endpoints {
+		if e.Upstream != removed {
+			kept = append(kept, e)
+		}
+	}
+	p.endpoints = kept
+	return nil
+}
+
+// Strategy returns the selection strategy currently in force.
+func (p *Pool) Strategy() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.strategy
+}
+
+// SetStrategy switches how upstreams are chosen. The name must be one the
+// configuration package recognises.
+func (p *Pool) SetStrategy(name string) error {
+	if !config.ValidStrategy(name) {
+		return fmt.Errorf("pool: unknown strategy %q", name)
+	}
+	p.mu.Lock()
+	p.strategy = name
+	p.mu.Unlock()
+	return nil
+}
+
+// Upstreams returns the configured upstreams in configuration order. The slice
+// is a copy, so callers may range over it while the pool changes underneath.
+func (p *Pool) Upstreams() []*Upstream {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]*Upstream(nil), p.upstreams...)
+}
+
+// Endpoints returns a copy of every endpoint across every upstream.
+func (p *Pool) Endpoints() []*Endpoint {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]*Endpoint(nil), p.endpoints...)
+}
 
 // Lookup finds an upstream by name.
 func (p *Pool) Lookup(name string) *Upstream {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	for _, u := range p.upstreams {
 		if u.Name == name {
 			return u
@@ -148,6 +261,8 @@ func (p *Pool) Lookup(name string) *Upstream {
 
 // HealthyUpstreams counts the Pi-holes currently answering.
 func (p *Pool) HealthyUpstreams() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	n := 0
 	for _, u := range p.upstreams {
 		if u.Healthy() && !u.Drained() {
@@ -171,6 +286,9 @@ func (p *Pool) HealthyUpstreams() int {
 //
 // Drained upstreams are skipped entirely unless they are all that is left.
 func (p *Pool) Plan() []*Endpoint {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	var healthy, down, drained []*Upstream
 	for _, u := range p.upstreams {
 		switch {
@@ -183,7 +301,7 @@ func (p *Pool) Plan() []*Endpoint {
 		}
 	}
 
-	ordered := p.order(healthy)
+	ordered := p.orderLocked(healthy)
 	plan := make([]*Endpoint, 0, len(p.endpoints))
 
 	for _, u := range ordered {
@@ -232,7 +350,9 @@ func (p *Pool) Plan() []*Endpoint {
 // order applies the selection strategy to the healthy upstreams. The entry it
 // returns first is the one that serves the query; the rest are the retry
 // order.
-func (p *Pool) order(healthy []*Upstream) []*Upstream {
+// orderLocked applies the selection strategy. The caller holds at least a read
+// lock, which is what makes reading p.strategy here safe.
+func (p *Pool) orderLocked(healthy []*Upstream) []*Upstream {
 	if len(healthy) < 2 {
 		return healthy
 	}
@@ -432,6 +552,9 @@ type UpstreamStatus struct {
 
 // Status snapshots the whole pool.
 func (p *Pool) Status() []UpstreamStatus {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	out := make([]UpstreamStatus, 0, len(p.upstreams))
 	for _, u := range p.upstreams {
 		active := u.Active()

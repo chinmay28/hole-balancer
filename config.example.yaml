@@ -119,13 +119,25 @@ fallback:
   summary_interval: 24h
 
 admin:
-  # HTTP endpoint serving /healthz, /status, and /metrics. Set to "" to
-  # disable. Keep it on loopback unless you want it reachable from the LAN.
+  # The web dashboard and its API, plus /healthz, /status, and /metrics.
+  # Set to "" to disable all of it.
+  #
+  # There is no authentication, so keep this on loopback unless you put
+  # something in front of it that authenticates.
   listen: "127.0.0.1:8053"
 
-  # Enables POST /drain and POST /undrain, which take a Pi-hole out of
-  # rotation for maintenance without editing config or restarting. There is no
-  # authentication, so only enable this on an address you trust.
+  # Makes the dashboard editable: add and remove Pi-holes, drain one for
+  # maintenance, change the fallback resolvers, switch strategy. Changes apply
+  # immediately and are written back to this file, keeping the previous version
+  # as <config>.bak.
+  #
+  # Two consequences worth knowing before you turn it on:
+  #   - Saving does not preserve comments. Once you edit through the web
+  #     interface, treat this file as machine-managed and keep notes elsewhere.
+  #   - With no authentication in front, anyone who can reach admin.listen can
+  #     repoint your DNS. Loopback-only is the safe default.
+  #
+  # Left false, the dashboard still shows everything but changes nothing.
   allow_control: false
 
 log:
