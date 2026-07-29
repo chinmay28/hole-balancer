@@ -27,6 +27,12 @@ type Checker struct {
 	pool    *pool.Pool
 	metrics *metrics.Metrics
 	log     *slog.Logger
+
+	// OnSweep, if set, runs after every sweep including the initial one. It
+	// gives the caller a regular chance to reassess pool-wide state that no
+	// single endpoint transition reports — an upstream drained by hand, for
+	// instance.
+	OnSweep func()
 }
 
 // New creates a health checker for the given pool.
@@ -53,6 +59,7 @@ func (c *Checker) Bootstrap(ctx context.Context) {
 		c.pool.SetInitial(e, err == nil, latency, err)
 	})
 
+	c.sweepDone()
 	c.log.Info("initial health sweep complete",
 		"healthy_upstreams", c.pool.HealthyUpstreams(),
 		"total_upstreams", len(c.pool.Upstreams()))
@@ -85,6 +92,13 @@ func (c *Checker) Sweep(ctx context.Context) {
 		c.countCheck(e, err)
 		c.pool.ReportProbe(e, err == nil, latency, err)
 	})
+	c.sweepDone()
+}
+
+func (c *Checker) sweepDone() {
+	if c.OnSweep != nil {
+		c.OnSweep()
+	}
 }
 
 func (c *Checker) forEachEndpoint(fn func(*pool.Endpoint)) {

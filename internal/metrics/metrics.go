@@ -146,6 +146,10 @@ type Metrics struct {
 	HealthChecks *CounterVec // by upstream, endpoint, result
 	StateFlips   *CounterVec // by upstream, endpoint, state
 	Duration     *Histogram
+
+	// Fallback covers the public resolvers used when no Pi-hole can answer.
+	FallbackResponses *CounterVec // by server, rcode
+	FallbackFailures  *CounterVec // by server, reason
 }
 
 // New creates the metric set with all series empty.
@@ -161,6 +165,10 @@ func New() *Metrics {
 		Duration: NewHistogram("holebalancer_query_duration_seconds",
 			"End-to-end time to answer a client query, including retries.",
 			[]float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5}),
+		FallbackResponses: NewCounterVec("holebalancer_fallback_responses_total",
+			"Queries answered by a public resolver because no Pi-hole could. These were NOT filtered."),
+		FallbackFailures: NewCounterVec("holebalancer_fallback_failures_total",
+			"Failed attempts against a public resolver, by reason."),
 	}
 
 	// Publish the unlabelled counters at zero straight away. A series that
@@ -190,6 +198,8 @@ func (m *Metrics) Render(gauges []Gauge) string {
 	m.HealthChecks.writeTo(&sb)
 	m.StateFlips.writeTo(&sb)
 	m.Duration.writeTo(&sb)
+	m.FallbackResponses.writeTo(&sb)
+	m.FallbackFailures.writeTo(&sb)
 
 	byName := map[string][]Gauge{}
 	var order []string

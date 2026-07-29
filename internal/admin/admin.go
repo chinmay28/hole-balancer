@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/chinmay28/hole-balancer/internal/config"
+	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
 )
@@ -24,11 +26,16 @@ type Server struct {
 	log     *slog.Logger
 	version string
 	started time.Time
+
+	fallback *fallback.Tracker
 }
 
 // New creates the admin server.
-func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, log *slog.Logger, version string) *Server {
-	return &Server{cfg: cfg, pool: p, metrics: m, log: log, version: version, started: time.Now()}
+func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, fb *fallback.Tracker, log *slog.Logger, version string) *Server {
+	return &Server{
+		cfg: cfg, pool: p, metrics: m, fallback: fb,
+		log: log, version: version, started: time.Now(),
+	}
 }
 
 // Handler builds the admin route table.
@@ -99,7 +106,20 @@ type statusResponse struct {
 	Strategy  string                `json:"strategy"`
 	Healthy   int                   `json:"healthy_upstreams"`
 	Total     int                   `json:"total_upstreams"`
+	Fallback  fallbackStatus        `json:"fallback"`
 	Upstreams []pool.UpstreamStatus `json:"upstreams"`
+}
+
+// fallbackStatus reports the public-DNS last resort: whether it is configured,
+// whether it is carrying traffic right now, and what it has served since the
+// last summary was written to the log.
+type fallbackStatus struct {
+	Enabled bool     `json:"enabled"`
+	Active  bool     `json:"active"`
+	Servers []string `json:"servers"`
+	Since   string   `json:"window_start,omitempty"`
+	Queries uint64   `json:"queries_this_window"`
+	Outages int      `json:"outages_this_window"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -109,6 +129,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		Strategy:  s.cfg.Strategy,
 		Healthy:   s.pool.HealthyUpstreams(),
 		Total:     len(s.pool.Upstreams()),
+		Fallback:  s.fallbackStatus(),
 		Upstreams: s.pool.Status(),
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -117,6 +138,21 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	if err := enc.Encode(resp); err != nil {
 		s.log.Debug("writing status response failed", "error", err)
 	}
+}
+
+func (s *Server) fallbackStatus() fallbackStatus {
+	fs := fallbackStatus{
+		Enabled: s.cfg.Fallback.Enabled,
+		Active:  s.cfg.Fallback.Enabled && s.pool.HealthyUpstreams() == 0,
+		Servers: s.cfg.Fallback.Servers,
+	}
+	if s.fallback != nil {
+		snap := s.fallback.Snapshot()
+		fs.Since = snap.Start.UTC().Format(time.RFC3339)
+		fs.Queries = snap.Queries
+		fs.Outages = snap.Episodes
+	}
+	return fs
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
@@ -133,6 +169,13 @@ func (s *Server) gauges() []metrics.Gauge {
 		Help:   "Build information; always 1.",
 		Labels: []metrics.Label{{Name: "version", Value: s.version}},
 		Value:  1,
+	})
+
+	fs := s.fallbackStatus()
+	out = append(out, metrics.Gauge{
+		Name:  "holebalancer_fallback_active",
+		Help:  "1 while queries are being answered by public DNS because no Pi-hole is up.",
+		Value: boolToFloat(fs.Active),
 	})
 
 	for _, u := range s.pool.Status() {
@@ -240,6 +283,17 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 				fmt.Fprintf(w, "  reason=%q", e.LastError)
 			}
 			fmt.Fprintln(w)
+		}
+	}
+	if fs := s.fallbackStatus(); fs.Enabled {
+		state := "standby"
+		if fs.Active {
+			state = "ACTIVE - answering unfiltered"
+		}
+		fmt.Fprintf(w, "\nfallback: %-28s %s\n", strings.Join(fs.Servers, ", "), state)
+		if fs.Queries > 0 || fs.Outages > 0 {
+			fmt.Fprintf(w, "          %d queries over %d outage(s) since %s\n",
+				fs.Queries, fs.Outages, fs.Since)
 		}
 	}
 	fmt.Fprint(w, "\nendpoints: /healthz  /status  /metrics\n")

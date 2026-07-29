@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chinmay28/hole-balancer/internal/config"
+	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
 )
@@ -34,7 +35,7 @@ func newTestAdmin(t *testing.T, allowControl bool) (*Server, *pool.Pool) {
 	p := pool.New(&cfg, nil)
 	m := metrics.New()
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	return New(&cfg, p, m, log, "test"), p
+	return New(&cfg, p, m, fallback.NewTracker(&cfg, log), log, "test"), p
 }
 
 func do(t *testing.T, s *Server, method, target string) *httptest.ResponseRecorder {
@@ -157,5 +158,61 @@ func TestIndexSummary(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("index is missing %q\n---\n%s", want, body)
 		}
+	}
+}
+
+func TestStatusReportsFallback(t *testing.T) {
+	s, p := newTestAdmin(t, false)
+
+	rec := do(t, s, http.MethodGet, "/status")
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Fallback.Enabled {
+		t.Error("fallback should report as enabled")
+	}
+	if !got.Fallback.Active {
+		t.Error("with no Pi-hole healthy, fallback should report as active")
+	}
+	if len(got.Fallback.Servers) == 0 {
+		t.Error("configured resolvers should be listed")
+	}
+
+	p.SetInitial(p.Endpoints()[0], true, time.Millisecond, nil)
+	rec = do(t, s, http.MethodGet, "/status")
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Fallback.Active {
+		t.Error("fallback should go inactive as soon as a Pi-hole answers")
+	}
+}
+
+func TestFallbackGaugeTracksPoolState(t *testing.T) {
+	s, p := newTestAdmin(t, false)
+
+	if body := do(t, s, http.MethodGet, "/metrics").Body.String(); !strings.Contains(body, "holebalancer_fallback_active 1") {
+		t.Errorf("gauge should be 1 while every Pi-hole is down\n---\n%s", body)
+	}
+
+	p.SetInitial(p.Endpoints()[0], true, time.Millisecond, nil)
+	if body := do(t, s, http.MethodGet, "/metrics").Body.String(); !strings.Contains(body, "holebalancer_fallback_active 0") {
+		t.Errorf("gauge should be 0 once a Pi-hole answers\n---\n%s", body)
+	}
+}
+
+func TestIndexShowsFallbackState(t *testing.T) {
+	s, p := newTestAdmin(t, false)
+
+	body := do(t, s, http.MethodGet, "/").Body.String()
+	if !strings.Contains(body, "ACTIVE - answering unfiltered") {
+		t.Errorf("an operator should see at a glance that answers are unfiltered\n---\n%s", body)
+	}
+
+	p.SetInitial(p.Endpoints()[0], true, time.Millisecond, nil)
+	body = do(t, s, http.MethodGet, "/").Body.String()
+	if !strings.Contains(body, "standby") {
+		t.Errorf("fallback should read as standby once a Pi-hole is up\n---\n%s", body)
 	}
 }

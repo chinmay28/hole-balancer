@@ -150,6 +150,64 @@ func TestValidationErrors(t *testing.T) {
 	}
 }
 
+func TestFallbackDefaults(t *testing.T) {
+	cfg, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !cfg.Fallback.Enabled {
+		t.Error("fallback should be on by default: losing every Pi-hole should not take DNS down")
+	}
+	want := []string{"8.8.8.8:53", "8.8.4.4:53"}
+	if len(cfg.Fallback.Servers) != len(want) {
+		t.Fatalf("servers = %v, want %v", cfg.Fallback.Servers, want)
+	}
+	for i := range want {
+		if cfg.Fallback.Servers[i] != want[i] {
+			t.Errorf("servers[%d] = %q, want %q (the default DNS port should be filled in)",
+				i, cfg.Fallback.Servers[i], want[i])
+		}
+	}
+	if cfg.Fallback.SummaryInterval.D() != 24*time.Hour {
+		t.Errorf("summary_interval = %v, want 24h", cfg.Fallback.SummaryInterval)
+	}
+}
+
+func TestFallbackCanBeDisabledWithoutServers(t *testing.T) {
+	cfg, err := Parse([]byte("fallback:\n  enabled: false\n  servers: []\n" + minimal))
+	if err != nil {
+		t.Fatalf("disabling fallback should not require servers: %v", err)
+	}
+	if cfg.Fallback.Enabled {
+		t.Error("fallback should be off")
+	}
+}
+
+func TestFallbackValidation(t *testing.T) {
+	cases := map[string]string{
+		"enabled with no servers": "fallback:\n  enabled: true\n  servers: []\n" + minimal,
+		"bad server address":      "fallback:\n  servers: [\"not:a:host\"]\n" + minimal,
+		"duplicate servers":       "fallback:\n  servers: [8.8.8.8, 8.8.8.8:53]\n" + minimal,
+		"zero timeout":            "fallback:\n  timeout: 0s\n" + minimal,
+		"zero summary interval":   "fallback:\n  summary_interval: 0s\n" + minimal,
+	}
+	for name, doc := range cases {
+		if _, err := Parse([]byte(doc)); err == nil {
+			t.Errorf("%s: Parse succeeded, want an error", name)
+		}
+	}
+}
+
+func TestFallbackServersAreOverriddenNotAppended(t *testing.T) {
+	cfg, err := Parse([]byte("fallback:\n  servers: [1.1.1.1]\n" + minimal))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Fallback.Servers) != 1 || cfg.Fallback.Servers[0] != "1.1.1.1:53" {
+		t.Errorf("servers = %v, want the configured list to replace the defaults", cfg.Fallback.Servers)
+	}
+}
+
 func TestProbeNameGetsTrailingDot(t *testing.T) {
 	cfg, err := Parse([]byte("health:\n  probe:\n    name: pi.hole\n" + minimal))
 	if err != nil {

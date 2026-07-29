@@ -12,6 +12,7 @@ import (
 	"github.com/chinmay28/hole-balancer/internal/config"
 	"github.com/chinmay28/hole-balancer/internal/dnsclient"
 	"github.com/chinmay28/hole-balancer/internal/dnsmsg"
+	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
 	"github.com/chinmay28/hole-balancer/internal/testdns"
@@ -30,6 +31,11 @@ func newTestServer(t *testing.T, tune func(*config.Config), upstreams ...*testdn
 	cfg.Listen = config.Listen{UDP: "127.0.0.1:0", TCP: "127.0.0.1:0"}
 	cfg.Query.Timeout = config.Duration(300 * time.Millisecond)
 	cfg.Admin.Listen = ""
+	// Off unless a test opts in, so no test can reach the real 8.8.8.8.
+	cfg.Fallback = config.Fallback{
+		Timeout:         config.Duration(300 * time.Millisecond),
+		SummaryInterval: config.Duration(time.Hour),
+	}
 	for i, u := range upstreams {
 		cfg.Upstreams = append(cfg.Upstreams, config.Upstream{
 			Name:      string(rune('a'+i)) + "-pihole",
@@ -49,7 +55,10 @@ func newTestServer(t *testing.T, tune func(*config.Config), upstreams ...*testdn
 	for _, e := range p.Endpoints() {
 		p.SetInitial(e, true, time.Millisecond, nil)
 	}
-	return New(&cfg, p, m, discardLogger()), p, m
+
+	log := discardLogger()
+	tracker := fallback.NewTracker(&cfg, log)
+	return New(&cfg, p, m, fallback.NewResolver(&cfg, tracker, m, log), log), p, m
 }
 
 func mustQuery(t *testing.T, name string) []byte {
@@ -397,5 +406,158 @@ func TestSlowUpstreamTimesOutAndRetries(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Errorf("took %v; the slow upstream should have been abandoned after the timeout", elapsed)
+	}
+}
+
+// withFallback points the test server's public-DNS last resort at fake
+// resolvers instead of the real 8.8.8.8.
+func withFallback(servers ...*testdns.Server) func(*config.Config) {
+	return func(c *config.Config) {
+		c.Fallback.Enabled = true
+		for _, s := range servers {
+			c.Fallback.Servers = append(c.Fallback.Servers, s.Addr())
+		}
+	}
+}
+
+// The headline of this feature: with every Pi-hole dead, clients still resolve.
+func TestFallbackAnswersWhenEveryPiholeIsDown(t *testing.T) {
+	a, b := testdns.Start(t), testdns.Start(t)
+	a.SetDrop(true)
+	b.SetDrop(true)
+	public := testdns.Start(t)
+
+	s, _, m := newTestServer(t, withFallback(public), a, b)
+
+	resp := s.Resolve(context.Background(), mustQuery(t, "example.com."), dnsclient.ProtoUDP)
+	if resp == nil {
+		t.Fatal("no response")
+	}
+	hdr, _ := dnsmsg.ParseHeader(resp)
+	if hdr.RCode != dnsmsg.RCodeNoError {
+		t.Errorf("rcode = %v, want the public resolver's answer instead of SERVFAIL", hdr.RCode)
+	}
+	if public.Queries() == 0 {
+		t.Error("the public resolver was never asked")
+	}
+	if m.Servfails.Value() != 0 {
+		t.Error("a query answered by fallback must not count as a servfail")
+	}
+}
+
+// Fallback is a last resort, not a shortcut: a working Pi-hole always wins.
+func TestFallbackIsNotUsedWhileAPiholeAnswers(t *testing.T) {
+	pihole, public := testdns.Start(t), testdns.Start(t)
+	s, _, _ := newTestServer(t, withFallback(public), pihole)
+
+	for i := 0; i < 25; i++ {
+		s.Resolve(context.Background(), mustQuery(t, "example.com."), dnsclient.ProtoUDP)
+	}
+	if public.Queries() != 0 {
+		t.Errorf("public resolver received %d queries while a Pi-hole was healthy", public.Queries())
+	}
+	if pihole.Queries() != 25 {
+		t.Errorf("Pi-hole received %d of 25 queries", pihole.Queries())
+	}
+}
+
+// Blocking still works during an outage for as long as any Pi-hole answers:
+// only queries no Pi-hole could serve reach the public resolver.
+func TestFallbackDoesNotBypassBlockingWhileAPiholeIsUp(t *testing.T) {
+	blocking, public := testdns.Start(t), testdns.Start(t)
+	blocking.SetRCode(dnsmsg.RCodeNXDomain)
+	s, _, _ := newTestServer(t, withFallback(public), blocking)
+
+	resp := s.Resolve(context.Background(), mustQuery(t, "ads.example."), dnsclient.ProtoUDP)
+	hdr, _ := dnsmsg.ParseHeader(resp)
+	if hdr.RCode != dnsmsg.RCodeNXDomain {
+		t.Errorf("rcode = %v, want the block to stand", hdr.RCode)
+	}
+	if public.Queries() != 0 {
+		t.Error("a blocked domain must never be re-asked upstream of Pi-hole")
+	}
+}
+
+// During a known outage the balancer must not burn its whole retry budget on
+// Pi-holes before reaching public DNS.
+func TestFallbackIsReachedQuicklyDuringAKnownOutage(t *testing.T) {
+	dead, public := testdns.Start(t), testdns.Start(t)
+	dead.SetDrop(true)
+
+	s, p, _ := newTestServer(t, func(c *config.Config) {
+		withFallback(public)(c)
+		c.Query.MaxAttempts = 5
+		c.Query.Timeout = config.Duration(200 * time.Millisecond)
+	}, dead)
+
+	// Mark the pool as known-down, the state a real outage settles into.
+	p.SetInitial(p.Endpoints()[0], false, 0, nil)
+	if p.HealthyUpstreams() != 0 {
+		t.Fatal("test setup: pool should be fully down")
+	}
+
+	before := dead.Queries()
+	start := time.Now()
+	resp := s.Resolve(context.Background(), mustQuery(t, "example.com."), dnsclient.ProtoUDP)
+	elapsed := time.Since(start)
+
+	hdr, _ := dnsmsg.ParseHeader(resp)
+	if hdr.RCode != dnsmsg.RCodeNoError {
+		t.Errorf("rcode = %v, want a fallback answer", hdr.RCode)
+	}
+	if attempts := dead.Queries() - before; attempts != 1 {
+		t.Errorf("made %d Pi-hole attempts during a known outage, want 1", attempts)
+	}
+	if elapsed > time.Second {
+		t.Errorf("took %v; a known outage should reach public DNS in about one timeout", elapsed)
+	}
+}
+
+// A stale "everything is down" verdict must not strand traffic on public DNS
+// when a Pi-hole is in fact answering.
+func TestOutageProbeStillNoticesARecoveredPihole(t *testing.T) {
+	pihole, public := testdns.Start(t), testdns.Start(t)
+	s, p, _ := newTestServer(t, withFallback(public), pihole)
+
+	p.SetInitial(p.Endpoints()[0], false, 0, nil)
+
+	resp := s.Resolve(context.Background(), mustQuery(t, "example.com."), dnsclient.ProtoUDP)
+	if resp == nil {
+		t.Fatal("no response")
+	}
+	if public.Queries() != 0 {
+		t.Error("the one outage probe reached a working Pi-hole, so fallback should not have run")
+	}
+	if pihole.Queries() != 1 {
+		t.Errorf("Pi-hole saw %d queries, want the single confirming attempt", pihole.Queries())
+	}
+}
+
+func TestServfailWhenPiholesAndFallbackAllFail(t *testing.T) {
+	dead, public := testdns.Start(t), testdns.Start(t)
+	dead.SetDrop(true)
+	public.SetDrop(true)
+
+	s, _, m := newTestServer(t, withFallback(public), dead)
+
+	resp := s.Resolve(context.Background(), mustQuery(t, "example.com."), dnsclient.ProtoUDP)
+	hdr, _ := dnsmsg.ParseHeader(resp)
+	if hdr.RCode != dnsmsg.RCodeServFail {
+		t.Errorf("rcode = %v, want SERVFAIL once nothing at all answers", hdr.RCode)
+	}
+	if m.Servfails.Value() != 1 {
+		t.Errorf("servfail metric = %d, want 1", m.Servfails.Value())
+	}
+}
+
+func TestFallbackDisabledStillServfails(t *testing.T) {
+	dead := testdns.Start(t)
+	dead.SetDrop(true)
+	s, _, _ := newTestServer(t, nil, dead) // fallback off by default in tests
+
+	resp := s.Resolve(context.Background(), mustQuery(t, "example.com."), dnsclient.ProtoUDP)
+	hdr, _ := dnsmsg.ParseHeader(resp)
+	if hdr.RCode != dnsmsg.RCodeServFail {
+		t.Errorf("rcode = %v, want SERVFAIL with fallback disabled", hdr.RCode)
 	}
 }
