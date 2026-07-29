@@ -315,6 +315,12 @@ statistics, and the controls to change any of it. It is a single self-contained
 page served from the binary — no CDN, no build step, nothing fetched over the
 network. That is deliberate: you open this page when DNS is broken.
 
+It is built for a phone first, for the same reason — when DNS stops working the
+laptop is usually the thing that stopped, so the phone is what you reach for.
+The layout reflows from one column to six, tap targets are thumb-sized, the
+chart is drawn to whatever width it is given and can be scrubbed with a finger,
+and the page never scrolls sideways. Pinch zoom is left enabled.
+
 It shows total queries and the recent rate, how many Pi-holes are up, **which
 one has handled the most**, average response time, the share of queries blocked,
 how many were answered unfiltered by public DNS, a queries-over-time chart

@@ -19,6 +19,11 @@
     colours: new Map(),
     editingFallback: false,
     editingAdd: false,
+    /** True while a reading is on screen. The five-second refresh rebuilds the
+     *  chart from scratch, which would otherwise yank the tooltip out from
+     *  under whoever is reading it — very visible on a phone, where a tap is
+     *  the only way to see a value. */
+    chartBusy: false,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -59,7 +64,8 @@
 
   function ms(v) {
     if (!v) return "—";
-    return v < 10 ? v.toFixed(2) + " ms" : Math.round(v) + " ms";
+    // A non-breaking space keeps "0.11 ms" on one line in a narrow stat tile.
+    return (v < 10 ? v.toFixed(2) : String(Math.round(v))) + "\u00a0ms";
   }
 
   function clockLabel(iso, range) {
@@ -278,6 +284,9 @@
     const host = $("traffic");
     if (!s) return;
 
+    // Do not redraw underneath someone reading a value off the chart.
+    if (state.chartBusy && host.firstChild) return;
+
     const points = state.range === "day" ? s.last_day : s.last_hour;
     host.textContent = "";
     if (!points || !points.length) {
@@ -291,14 +300,18 @@
       ? `${num(total)} queries in the last 24 hours, by hour.`
       : `${num(total)} queries in the last hour, by minute.`;
 
-    const W = 900, H = 190;
-    const pad = { t: 12, r: 12, b: 24, l: 42 };
+    // The viewBox is sized to the element's actual width so the mapping is
+    // 1:1. Stretching a fixed viewBox to fit would squash the axis labels
+    // horizontally, which on a phone makes them unreadable.
+    const W = Math.max(260, Math.round(host.clientWidth || 900));
+    const H = W < 520 ? 160 : 190;
+    const pad = { t: 12, r: 10, b: 22, l: W < 420 ? 32 : 42 };
     const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
     const max = Math.max(...points.map((p) => p.queries), 1);
     const niceMax = niceCeil(max);
 
     const svg = svgEl("svg", {
-      viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none",
+      viewBox: `0 0 ${W} ${H}`,
       role: "img",
       "aria-label": `Queries per ${state.range === "day" ? "hour" : "minute"}, ${num(total)} total`,
     });
@@ -325,9 +338,12 @@
       }));
     }
 
-    const step = Math.max(1, Math.floor(points.length / 6));
+    // Fewer labels on a narrow screen, so they never collide.
+    const wantTicks = Math.max(2, Math.min(6, Math.floor(iw / 62)));
+    const step = Math.max(1, Math.ceil(points.length / wantTicks));
     for (let i = 0; i < points.length; i += step) {
-      const t = svgEl("text", { class: "tick", x: x(i), y: H - 7, "text-anchor": "middle" });
+      const anchor = i === 0 ? "start" : i > points.length - step ? "end" : "middle";
+      const t = svgEl("text", { class: "tick", x: x(i), y: H - 6, "text-anchor": anchor });
       t.textContent = clockLabel(points[i].at, state.range);
       svg.append(t);
     }
@@ -340,9 +356,12 @@
     const tip = el("div", "tooltip");
     tip.hidden = true;
     host.append(tip);
+    let tipTimer = null;
 
-    // Hover layer: an HTML chart is interactive by default.
-    svg.addEventListener("pointermove", (ev) => {
+    // Hover layer: an HTML chart is interactive by default. Bound to pointer
+    // events rather than mouse ones so a finger scrubs the same way a cursor
+    // hovers.
+    const showAt = (ev) => {
       const box = svg.getBoundingClientRect();
       const rel = ((ev.clientX - box.left) / box.width) * W;
       let i = Math.round(((rel - pad.l) / iw) * (points.length - 1));
@@ -367,14 +386,35 @@
       if (p.failed) tip.append(row("failed", num(p.failed)));
       tip.hidden = false;
 
+      // Keep the tooltip inside the chart, and out from under the finger.
       const px = (x(i) / W) * box.width;
-      tip.style.left = Math.min(Math.max(px + 12, 4), box.width - tip.offsetWidth - 4) + "px";
-      tip.style.top = "6px";
-    });
-    svg.addEventListener("pointerleave", () => {
+      const tw = tip.offsetWidth;
+      tip.style.left = Math.min(Math.max(px - tw / 2, 2), Math.max(2, box.width - tw - 2)) + "px";
+      tip.style.top = "4px";
+      state.chartBusy = true;
+    };
+    const hide = () => {
+      clearTimeout(tipTimer);
+      state.chartBusy = false;
       tip.hidden = true;
       cross.setAttribute("opacity", 0);
       cursor.setAttribute("opacity", 0);
+    };
+
+    svg.addEventListener("pointermove", showAt);
+    svg.addEventListener("pointerdown", showAt);
+    svg.addEventListener("pointercancel", hide);
+    // A touch pointer "leaves" the moment the finger lifts, so honouring that
+    // event for touch would hide the reading before it could be read. Only a
+    // mouse leaving means the cursor has actually moved away.
+    svg.addEventListener("pointerleave", (ev) => {
+      if (ev.pointerType === "mouse") hide();
+    });
+    // After a tap, leave the reading up long enough to read, then clear it.
+    svg.addEventListener("pointerup", (ev) => {
+      if (ev.pointerType === "mouse") return;
+      clearTimeout(tipTimer);
+      tipTimer = setTimeout(hide, 4000);
     });
 
     if (anyFallback) {
@@ -427,11 +467,19 @@
       const eps = el("ul", "eps");
       for (const e of u.endpoints) {
         const li = el("li", "ep");
-        li.append(el("span", "star", e.preferred ? "★" : ""));
-        li.append(el("span", null, e.addr));
-        li.append(el("span", "state " + (e.healthy ? "up" : "down"), e.healthy ? "up" : "down"));
-        if (e.healthy && e.latency_ms) li.append(el("span", null, ms(e.latency_ms)));
-        if (e.queries) li.append(el("span", null, `${num(e.queries)} q`));
+
+        const main = el("span", "ep-main");
+        const star = el("span", "star", e.preferred ? "★" : "");
+        if (e.preferred) star.title = "carrying this Pi-hole's traffic";
+        main.append(star, el("span", "addr", e.addr));
+        li.append(main);
+
+        const facts = el("span", "ep-facts");
+        facts.append(el("span", "state " + (e.healthy ? "up" : "down"), e.healthy ? "up" : "down"));
+        if (e.healthy && e.latency_ms) facts.append(el("span", null, ms(e.latency_ms)));
+        if (e.queries) facts.append(el("span", null, `${num(e.queries)} q`));
+        li.append(facts);
+
         if (!e.healthy && e.last_error) li.append(el("span", "why", e.last_error));
         eps.append(li);
       }
@@ -583,6 +631,7 @@
       b.addEventListener("click", () => {
         document.querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("is-on", x === b));
         state.range = b.dataset.range;
+        state.chartBusy = false;
         renderTraffic();
       });
     }
@@ -634,6 +683,20 @@
       const ok = await mutate("PUT", "/api/fallback",
         { enabled: $("fb-enabled").checked, servers }, "Fallback saved");
       if (ok) state.editingFallback = false;
+    });
+
+    // The chart is drawn to the pixel width it occupies, so a rotation or a
+    // window resize has to redraw it.
+    let resizeTimer = null;
+    let lastWidth = window.innerWidth;
+    addEventListener("resize", () => {
+      if (window.innerWidth === lastWidth) return; // iOS fires on scroll
+      lastWidth = window.innerWidth;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        state.chartBusy = false;
+        renderTraffic();
+      }, 150);
     });
 
     refresh();

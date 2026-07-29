@@ -290,3 +290,36 @@ func TestTextSummaryStillServedSeparately(t *testing.T) {
 		t.Errorf("summary body = %q", rec.Body.String())
 	}
 }
+
+// The dashboard gets opened from a phone — often *because* the laptop stopped
+// resolving — so the page must declare a mobile viewport and must not disable
+// pinch zoom.
+func TestUIIsMobileReady(t *testing.T) {
+	s, _ := newTestAdmin(t, true)
+	body := send(t, s, http.MethodGet, "/", "").Body.String()
+
+	if !strings.Contains(body, `name="viewport"`) ||
+		!strings.Contains(body, "width=device-width") {
+		t.Error("page is missing a mobile viewport declaration")
+	}
+	// Blocking zoom is an accessibility failure, and the usual reason a page
+	// gets away with tiny text.
+	for _, banned := range []string{"user-scalable=no", "maximum-scale=1"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("viewport must not disable zoom, found %q", banned)
+		}
+	}
+
+	// The layout is mobile-first: these are the rules that make it work, and
+	// losing any of them silently degrades the phone experience.
+	for _, want := range []string{
+		"@media (min-width: 560px)", // the first widen-up breakpoint
+		"@media (pointer: coarse)",  // thumb-sized tap targets
+		"env(safe-area-inset-left)", // notch and home-indicator insets
+		"overflow-x: hidden",        // the page itself never scrolls sideways
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stylesheet is missing %q", want)
+		}
+	}
+}

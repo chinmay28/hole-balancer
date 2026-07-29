@@ -63,6 +63,10 @@ five seconds and needs no build step, no monitoring stack, and no internet — i
 is served by the balancer itself, which matters because you will be opening it
 exactly when DNS is broken.
 
+It works properly on a phone, which is usually what you have to hand when the
+laptop has stopped resolving: everything reflows to one column, the buttons are
+big enough to hit with a thumb, and tapping the chart gives you a reading.
+
 **At the top** — total queries, how many Pi-holes are up, which one is busiest,
 average response time, how much is being blocked, and how much has been answered
 unfiltered by public DNS.
