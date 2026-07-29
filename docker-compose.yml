@@ -1,0 +1,37 @@
+services:
+  hole-balancer:
+    build:
+      context: .
+    image: hole-balancer:latest
+    container_name: hole-balancer
+    restart: unless-stopped
+
+    # The container runs unprivileged and listens on 5300, so the host's
+    # port 53 is mapped onto it. Set listen.udp and listen.tcp to ":5300" in
+    # your config for this to line up.
+    ports:
+      - "53:5300/udp"
+      - "53:5300/tcp"
+      - "127.0.0.1:8053:8053/tcp"
+
+    volumes:
+      - ./config.yaml:/etc/hole-balancer/config.yaml:ro
+
+    # Host networking is the alternative if your Pi-holes are discovered by
+    # LAN broadcast or you want the real client IPs in Pi-hole's query log.
+    # Swap the ports block above for:
+    #   network_mode: host
+
+    healthcheck:
+      # The image has no shell or curl, so the balancer probes its own admin
+      # endpoint. This fails once no Pi-hole is answering.
+      test: ["CMD", "/usr/local/bin/hole-balancer", "-healthcheck", "-config", "/etc/hole-balancer/config.yaml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
