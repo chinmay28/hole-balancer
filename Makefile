@@ -2,7 +2,7 @@ BINARY  := hole-balancer
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test race lint vet fmt cover clean install run
+.PHONY: all build test race lint vet fmt cover clean install run quickstart
 
 all: fmt vet test build
 
@@ -45,6 +45,10 @@ install: build
 # Run against config.yaml on high ports, no privileges needed.
 run: build
 	./$(BINARY) -config config.yaml
+
+# Build, configure, and start in one step. See QUICKSTART.md.
+quickstart:
+	./quickstart.sh
 
 clean:
 	rm -rf $(BINARY) dist coverage.out

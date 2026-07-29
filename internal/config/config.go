@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,13 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	*d = Duration(parsed)
 	return nil
 }
+
+// MarshalYAML writes a duration back as the string form it was read in.
+//
+// Without this, saving would emit a raw nanosecond count, which the parser
+// above would then read back as that many *seconds* — a config the balancer
+// wrote would not survive its own restart.
+func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
 
 // D returns the wrapped time.Duration.
 func (d Duration) D() time.Duration { return time.Duration(d) }
@@ -235,6 +243,139 @@ func Default() Config {
 		Admin: Admin{Listen: "127.0.0.1:8053"},
 		Log:   Log{Level: "info"},
 	}
+}
+
+// ValidStrategy reports whether name is a selection strategy the balancer
+// implements.
+func ValidStrategy(name string) bool { return contains(validStrategies, name) }
+
+// Strategies lists the selection strategies, for the management interface.
+func Strategies() []string { return append([]string(nil), validStrategies...) }
+
+// NormaliseAddr validates a DNS server address and supplies the default port
+// when one is not given. It is exported so the management interface can check
+// an address the moment it is typed, using exactly the rules the config file
+// obeys.
+func NormaliseAddr(addr string) (string, error) { return normaliseAddr(addr) }
+
+// PrepareUpstream fills in an upstream's defaults and normalises its
+// addresses, returning the cleaned copy. It is the single definition of what a
+// well-formed upstream is, shared by the config file and the management API so
+// the two can never drift.
+func PrepareUpstream(u Upstream) (Upstream, error) {
+	u.Name = strings.TrimSpace(u.Name)
+	if u.Name == "" {
+		return u, fmt.Errorf("name must not be empty")
+	}
+	if strings.ContainsAny(u.Name, "/?#\\") {
+		return u, fmt.Errorf("name must not contain /, ?, # or backslash")
+	}
+	if u.Weight == 0 {
+		u.Weight = 1
+	}
+	if u.Weight < 0 {
+		return u, fmt.Errorf("weight must not be negative")
+	}
+	if len(u.Endpoints) == 0 {
+		return u, fmt.Errorf("at least one endpoint is required")
+	}
+
+	seen := make(map[string]bool, len(u.Endpoints))
+	cleaned := make([]Endpoint, 0, len(u.Endpoints))
+	for i, ep := range u.Endpoints {
+		addr, err := normaliseAddr(ep.Addr)
+		if err != nil {
+			return u, fmt.Errorf("endpoint %d: %w", i+1, err)
+		}
+		if seen[addr] {
+			return u, fmt.Errorf("endpoint %s is listed twice", addr)
+		}
+		seen[addr] = true
+		ep.Addr = addr
+		if ep.Name == "" {
+			ep.Name = addr
+		}
+		cleaned = append(cleaned, ep)
+	}
+	u.Endpoints = cleaned
+	return u, nil
+}
+
+// managedHeader is prepended to any configuration the balancer writes itself.
+const managedHeader = `# hole-balancer configuration.
+#
+# This file is written by the management interface. Comments are not preserved
+# across a save, so keep notes elsewhere if you edit it by hand.
+#
+# The full annotated reference lives in config.example.yaml.
+`
+
+// Save writes the configuration to path in YAML.
+//
+// The write goes to a temporary file in the same directory and is then
+// renamed, so a crash midway leaves the previous configuration intact rather
+// than a half-written one that will not parse on the next boot. The previous
+// contents are kept alongside as <path>.bak.
+func (c *Config) Save(path string) error {
+	body, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("encoding config: %w", err)
+	}
+	out := append([]byte(managedHeader), body...)
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".hole-balancer-config-*.yaml")
+	if err != nil {
+		return fmt.Errorf("creating temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing config: %w", err)
+	}
+	// Flush to disk before the rename, so the rename cannot expose an empty file.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("syncing config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if prev, err := os.ReadFile(path); err == nil {
+		if err := os.WriteFile(path+".bak", prev, 0o600); err != nil {
+			return fmt.Errorf("writing backup: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading existing config: %w", err)
+	}
+
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// Clone returns a deep copy, so a caller can stage edits without disturbing
+// the configuration the running server is reading.
+func (c *Config) Clone() *Config {
+	out := *c
+	out.Query.RetryRCodes = append([]string(nil), c.Query.RetryRCodes...)
+	out.Fallback.Servers = append([]string(nil), c.Fallback.Servers...)
+	out.Upstreams = make([]Upstream, len(c.Upstreams))
+	for i, u := range c.Upstreams {
+		u.Endpoints = append([]Endpoint(nil), u.Endpoints...)
+		out.Upstreams[i] = u
+	}
+	if c.Query.retryRCodes != nil {
+		out.Query.retryRCodes = make(map[dnsmsg.RCode]bool, len(c.Query.retryRCodes))
+		for k, v := range c.Query.retryRCodes {
+			out.Query.retryRCodes[k] = v
+		}
+	}
+	return &out
 }
 
 // Load reads, parses, and validates the configuration file at path.

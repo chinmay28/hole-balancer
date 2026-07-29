@@ -394,3 +394,167 @@ func TestConcurrentReportsAndPlans(t *testing.T) {
 		<-done
 	}
 }
+
+func TestAddBringsAnUpstreamIntoRotation(t *testing.T) {
+	p := newTestPool(t, config.StrategyFailover, 1, 1)
+
+	u, err := p.Add(config.Upstream{
+		Name:      "added",
+		Weight:    2,
+		Endpoints: []config.Endpoint{{Name: "lan", Addr: "10.9.9.9:53"}},
+	})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if len(p.Upstreams()) != 2 || len(p.Endpoints()) != 2 {
+		t.Errorf("pool = %d upstreams, %d endpoints", len(p.Upstreams()), len(p.Endpoints()))
+	}
+	// A new Pi-hole starts down: nothing has proved it answers yet.
+	if u.Healthy() {
+		t.Error("a freshly added upstream should not be presumed healthy")
+	}
+	// It is still reachable through the fail-open tier, so a pool that is
+	// entirely new is not dead on arrival.
+	found := false
+	for _, e := range p.Plan() {
+		if e.Upstream == u {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a down upstream should still appear in the last-resort tier")
+	}
+}
+
+func TestAddRejectsDuplicates(t *testing.T) {
+	p := newTestPool(t, config.StrategyRandom, 2, 1)
+
+	if _, err := p.Add(config.Upstream{
+		Name: "pihole-1", Endpoints: []config.Endpoint{{Addr: "10.9.9.9:53"}},
+	}); !errors.Is(err, ErrDuplicateName) {
+		t.Errorf("duplicate name = %v, want ErrDuplicateName", err)
+	}
+
+	// The same machine under two names would take two slots in the draw.
+	if _, err := p.Add(config.Upstream{
+		Name: "clone", Endpoints: []config.Endpoint{{Addr: "10.0.1.1:53"}},
+	}); err == nil {
+		t.Error("an address already in the pool should be refused")
+	}
+	if len(p.Upstreams()) != 2 {
+		t.Error("a refused add changed the pool")
+	}
+}
+
+func TestRemoveTakesEndpointsWithIt(t *testing.T) {
+	p := newTestPool(t, config.StrategyFailover, 3, 2)
+
+	if err := p.Remove("pihole-2"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if len(p.Upstreams()) != 2 {
+		t.Errorf("upstreams = %d, want 2", len(p.Upstreams()))
+	}
+	if len(p.Endpoints()) != 4 {
+		t.Errorf("endpoints = %d, want 4", len(p.Endpoints()))
+	}
+	for _, e := range p.Endpoints() {
+		if e.Upstream.Name == "pihole-2" {
+			t.Error("a removed upstream's endpoints are still being probed")
+		}
+	}
+	for _, e := range p.Plan() {
+		if e.Upstream.Name == "pihole-2" {
+			t.Error("a removed upstream is still receiving queries")
+		}
+	}
+
+	if err := p.Remove("pihole-2"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("removing twice = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRemoveRefusesTheLastUpstream(t *testing.T) {
+	p := newTestPool(t, config.StrategyRandom, 1, 1)
+	if err := p.Remove("pihole-1"); !errors.Is(err, ErrLastUpstream) {
+		t.Errorf("err = %v, want ErrLastUpstream", err)
+	}
+	if len(p.Upstreams()) != 1 {
+		t.Error("the refused removal took effect")
+	}
+}
+
+func TestSetStrategyTakesEffectImmediately(t *testing.T) {
+	p := newTestPool(t, config.StrategyRandom, 3, 1)
+
+	if err := p.SetStrategy(config.StrategyFailover); err != nil {
+		t.Fatalf("SetStrategy: %v", err)
+	}
+	if got := p.Strategy(); got != config.StrategyFailover {
+		t.Errorf("Strategy = %q", got)
+	}
+	for i := 0; i < 10; i++ {
+		if got := p.Plan()[0].Upstream.Name; got != "pihole-1" {
+			t.Fatalf("plan still uses the old strategy, picked %s", got)
+		}
+	}
+
+	if err := p.SetStrategy("sticky"); err == nil {
+		t.Error("an unknown strategy should be refused")
+	}
+	if got := p.Strategy(); got != config.StrategyFailover {
+		t.Errorf("a refused change altered the strategy to %q", got)
+	}
+}
+
+func TestAccessorsReturnCopies(t *testing.T) {
+	p := newTestPool(t, config.StrategyRandom, 2, 1)
+
+	ups := p.Upstreams()
+	ups[0] = nil
+	if p.Upstreams()[0] == nil {
+		t.Error("Upstreams handed out the live slice")
+	}
+
+	eps := p.Endpoints()
+	eps[0] = nil
+	if p.Endpoints()[0] == nil {
+		t.Error("Endpoints handed out the live slice")
+	}
+}
+
+// Membership changes while queries are in flight must not race or panic.
+func TestConcurrentMembershipChanges(t *testing.T) {
+	p := newTestPool(t, config.StrategyRandom, 3, 1)
+	done := make(chan struct{})
+
+	for i := 0; i < 4; i++ {
+		go func() {
+			for j := 0; j < 400; j++ {
+				p.Plan()
+				p.Status()
+				p.HealthyUpstreams()
+			}
+			done <- struct{}{}
+		}()
+	}
+	go func() {
+		for j := 0; j < 200; j++ {
+			name := fmt.Sprintf("churn-%d", j)
+			if _, err := p.Add(config.Upstream{
+				Name: name, Weight: 1,
+				Endpoints: []config.Endpoint{{Name: "lan", Addr: fmt.Sprintf("10.5.%d.%d:53", j/250, j%250)}},
+			}); err == nil {
+				_ = p.Remove(name)
+			}
+		}
+		done <- struct{}{}
+	}()
+
+	for i := 0; i < 5; i++ {
+		<-done
+	}
+	if len(p.Upstreams()) != 3 {
+		t.Errorf("pool ended with %d upstreams, want 3", len(p.Upstreams()))
+	}
+}

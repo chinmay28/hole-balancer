@@ -1,0 +1,9 @@
+.git
+.github
+dist/
+hole-balancer
+config.yaml
+config.yaml.bak
+coverage.out
+*.test
+node_modules

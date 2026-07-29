@@ -22,11 +22,13 @@ import (
 
 	"github.com/chinmay28/hole-balancer/internal/admin"
 	"github.com/chinmay28/hole-balancer/internal/config"
+	"github.com/chinmay28/hole-balancer/internal/control"
 	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/health"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
 	"github.com/chinmay28/hole-balancer/internal/proxy"
+	"github.com/chinmay28/hole-balancer/internal/stats"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -101,6 +103,16 @@ func run() error {
 	})
 
 	fbResolver := fallback.NewResolver(cfg, fbTracker, m, log)
+	collector := stats.New()
+	manager := control.New(control.Options{
+		Config:     cfg,
+		Path:       *configPath,
+		Pool:       p,
+		Fallback:   fbResolver,
+		Stats:      collector,
+		Log:        log,
+		AllowWrite: cfg.Admin.AllowControl,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -122,6 +134,9 @@ func run() error {
 				"interval", cfg.Health.Interval.String())
 		}
 	}
+	log.Info("management interface available",
+		"url", "http://"+cfg.Admin.Listen+"/",
+		"editable", cfg.Admin.AllowControl)
 	if fbResolver.Enabled() {
 		log.Info("public DNS fallback armed",
 			"resolvers", strings.Join(fbResolver.Servers(), ", "),
@@ -159,14 +174,27 @@ func run() error {
 		fbTracker.Run(ctx)
 	}()
 
-	adminSrv := admin.New(cfg, p, m, fbTracker, log, buildVersion())
+	adminSrv := admin.New(admin.Options{
+		Config:   cfg,
+		Pool:     p,
+		Metrics:  m,
+		Fallback: fbTracker,
+		Resolver: fbResolver,
+		Stats:    collector,
+		Control:  manager,
+		Log:      log,
+		Version:  buildVersion(),
+		// Lets the management interface confirm a newly added Pi-hole at once
+		// instead of showing it as down until the next scheduled sweep.
+		ProbeNow: func() { go checker.Sweep(ctx) },
+	})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		fail(adminSrv.ListenAndServe(ctx))
 	}()
 
-	dnsSrv := proxy.New(cfg, p, m, fbResolver, log)
+	dnsSrv := proxy.New(cfg, p, m, fbResolver, collector, log)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

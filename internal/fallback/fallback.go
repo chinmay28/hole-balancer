@@ -32,12 +32,16 @@ var ErrDisabled = errors.New("fallback: disabled")
 
 // Resolver forwards a query to the configured public resolvers.
 type Resolver struct {
-	servers []string
 	timeout time.Duration
 	retry   func(dnsmsg.RCode) bool
 	tracker *Tracker
 	metrics *metrics.Metrics
 	log     *slog.Logger
+
+	// mu guards servers, which the management interface can replace while
+	// queries are in flight.
+	mu      sync.RWMutex
+	servers []string
 
 	rr atomic.Uint64
 }
@@ -58,14 +62,38 @@ func NewResolver(cfg *config.Config, tracker *Tracker, m *metrics.Metrics, log *
 }
 
 // Enabled reports whether any public resolver is configured.
-func (r *Resolver) Enabled() bool { return r != nil && len(r.servers) > 0 }
+func (r *Resolver) Enabled() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.servers) > 0
+}
 
 // Servers lists the configured public resolvers.
 func (r *Resolver) Servers() []string {
 	if r == nil {
 		return nil
 	}
-	return r.servers
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]string(nil), r.servers...)
+}
+
+// SetServers replaces the resolver list. Passing enabled false clears it, which
+// is what makes Enabled report false without a second flag to keep in step.
+//
+// Addresses are expected to be normalised already; the management layer does
+// that so a bad address is rejected before anything is changed.
+func (r *Resolver) SetServers(enabled bool, servers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !enabled {
+		r.servers = nil
+		return
+	}
+	r.servers = append([]string(nil), servers...)
 }
 
 // Resolve forwards req to the public resolvers, trying each in turn until one
@@ -78,7 +106,11 @@ func (r *Resolver) Resolve(ctx context.Context, req []byte, proto string) ([]byt
 		return nil, "", ErrDisabled
 	}
 
-	n := len(r.servers)
+	servers := r.Servers()
+	n := len(servers)
+	if n == 0 {
+		return nil, "", ErrDisabled
+	}
 	start := int(r.rr.Add(1)-1) % n
 	var lastErr error
 
@@ -86,7 +118,7 @@ func (r *Resolver) Resolve(ctx context.Context, req []byte, proto string) ([]byt
 		if ctx.Err() != nil {
 			return nil, "", ctx.Err()
 		}
-		server := r.servers[(start+i)%n]
+		server := servers[(start+i)%n]
 
 		resp, _, err := dnsclient.Exchange(ctx, proto, server, req, r.timeout)
 		if err != nil {

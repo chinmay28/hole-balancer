@@ -1,5 +1,6 @@
 /hole-balancer
 /dist/
 /config.yaml
+/config.yaml.bak
 *.test
 coverage.out
