@@ -1,0 +1,5 @@
+/hole-balancer
+/dist/
+/config.yaml
+*.test
+coverage.out

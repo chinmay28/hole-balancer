@@ -1,0 +1,136 @@
+# hole-balancer configuration.
+#
+# Every key below is optional except `upstreams`. The values shown are the
+# defaults, so you can delete anything you do not want to change.
+
+listen:
+  # Where clients send their DNS queries. Use ":53" to accept from anywhere on
+  # the LAN, or "192.168.1.2:53" to bind one interface. Set either to "" to
+  # turn that transport off; both must not be empty.
+  #
+  # Binding port 53 needs privileges — see the README.
+  udp: ":53"
+  tcp: ":53"
+
+# How an upstream is chosen for each query.
+#
+#   random         weighted random draw across the healthy upstreams. The
+#                  default: spreads load and has no shared state to contend on.
+#   round-robin    strict rotation. Perfectly even, at the cost of being
+#                  predictable.
+#   failover       always the first healthy upstream in the list below. Use
+#                  this when one Pi-hole is the primary and the rest are spares.
+#   least-latency  the healthy upstream with the lowest measured round-trip
+#                  time. Good when one Pi-hole is on the LAN and another is
+#                  across a Tailscale link.
+strategy: random
+
+query:
+  # How long to wait for one upstream before giving up on it. This is per
+  # attempt, not per query.
+  timeout: 2s
+
+  # How many upstreams to try before returning SERVFAIL. Each attempt goes to a
+  # different endpoint, so 3 means "ask up to three servers".
+  max_attempts: 3
+
+  # Queries in flight before the balancer starts shedding load with SERVFAIL.
+  max_concurrent: 1024
+
+  # Response codes that mean "this server could not do its job", and so are
+  # worth re-asking somewhere else.
+  #
+  # Note that a domain blocked by Pi-hole comes back as NXDOMAIN or as an
+  # answer pointing at 0.0.0.0 — never as one of these — so retrying here does
+  # not weaken your blocklists. Do not add NXDOMAIN to this list: that would
+  # make the balancer shop around until some upstream failed to block a domain.
+  retry_rcodes: [SERVFAIL, REFUSED]
+
+health:
+  # How often every endpoint is probed. Down endpoints are probed too; it is
+  # the only way they can come back.
+  interval: 10s
+
+  # How long a probe waits for an answer.
+  timeout: 2s
+
+  # Consecutive successes needed to return an endpoint to rotation, and
+  # consecutive failures needed to take it out. Both damp flapping on a lossy
+  # link. Raise `fall` if a marginal Wi-Fi link causes false outages; lower it
+  # for faster failure detection.
+  rise: 2
+  fall: 2
+
+  # The initial sweep runs before the listeners open, so the first query is
+  # routed on fact rather than a guess. Its result applies immediately, without
+  # waiting for `rise`.
+  startup_timeout: 3s
+
+  probe:
+    # The name each probe asks for. Any well-formed reply — including
+    # NXDOMAIN — counts as "this server is alive", so a probe name that lands
+    # on one Pi-hole's blocklist will not be mistaken for an outage.
+    name: dns.google.
+    type: A
+
+    # Set to true to demand a non-empty answer section, which additionally
+    # proves the Pi-hole's own upstream resolver is working. Stricter, but it
+    # will report a false outage if `name` is ever blocked or goes away.
+    require_answer: false
+
+  passive:
+    # Count real client query failures toward the health verdict, not just
+    # probes. This notices a dead Pi-hole in milliseconds instead of waiting
+    # for the next interval.
+    enabled: true
+
+admin:
+  # HTTP endpoint serving /healthz, /status, and /metrics. Set to "" to
+  # disable. Keep it on loopback unless you want it reachable from the LAN.
+  listen: "127.0.0.1:8053"
+
+  # Enables POST /drain and POST /undrain, which take a Pi-hole out of
+  # rotation for maintenance without editing config or restarting. There is no
+  # authentication, so only enable this on an address you trust.
+  allow_control: false
+
+log:
+  # debug, info, warn, or error.
+  level: info
+
+  # Log one line per client query. Useful while tuning; noisy in steady state.
+  # Note that this records every domain every device on your network looks up.
+  queries: false
+
+# The Pi-hole servers. At least one is required.
+#
+# Each entry is one physical Pi-hole. If a Pi-hole is reachable by more than
+# one route — a LAN address and a Tailscale address, say — list every route
+# under that one upstream rather than as separate upstreams. Routes are tried
+# in order, so put the fast one first: the balancer only uses the Tailscale
+# address when the LAN address stops answering, and one Pi-hole still counts
+# once in the load spread either way.
+upstreams:
+  - name: pihole-living-room
+    # Relative share of traffic under the `random` strategy. Defaults to 1.
+    weight: 1
+    endpoints:
+      - 192.168.1.10          # LAN, preferred
+      - 100.101.102.103       # Tailscale, used if the LAN path fails
+
+  - name: pihole-office
+    weight: 1
+    endpoints:
+      # The long form lets you label a route so it reads clearly in /status
+      # and in metrics.
+      - name: lan
+        addr: 192.168.1.11
+      - name: tailscale
+        addr: 100.101.102.104
+
+  # A Pi-hole reachable only over Tailscale, on a non-standard port. Give it a
+  # lower weight so it takes less of the traffic than the LAN servers.
+  # - name: pihole-remote
+  #   weight: 1
+  #   endpoints:
+  #     - 100.101.102.105:5353

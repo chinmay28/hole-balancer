@@ -1,0 +1,47 @@
+[Unit]
+Description=hole-balancer: DNS load balancer for Pi-hole
+Documentation=https://github.com/chinmay28/hole-balancer
+After=network-online.target
+Wants=network-online.target
+# If Tailscale provides the only route to some upstreams, uncomment so the
+# balancer's initial health sweep sees them.
+# After=tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hole-balancer -config /etc/hole-balancer/config.yaml
+Restart=on-failure
+RestartSec=2s
+
+# Bind port 53 without running as root. DynamicUser gives the service a
+# transient unprivileged account that exists only while it runs.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# The balancer opens sockets and reads one config file. Nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Logs go to the journal: journalctl -u hole-balancer -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
