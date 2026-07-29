@@ -84,6 +84,40 @@ health:
     # for the next interval.
     enabled: true
 
+# What to do when NO Pi-hole can answer — every one is down, unreachable, or
+# still booting after a power cut.
+#
+# Without this, DNS simply fails and nothing on the network resolves. With it,
+# queries go to a public resolver so the network keeps working.
+#
+# The trade is real and worth understanding: a public resolver knows nothing
+# about your blocklists, so while fallback is carrying traffic, ads are NOT
+# blocked. It only ever engages when no Pi-hole could serve the query, so
+# normal operation is unaffected. Set enabled to false if you would rather DNS
+# fail than go unfiltered.
+fallback:
+  enabled: true
+
+  # Tried in rotation, so a long outage spreads across them rather than
+  # hammering the first. Both of Google's anycast resolvers by default; swap in
+  # Cloudflare (1.1.1.1, 1.0.0.1) or Quad9 (9.9.9.9) if you prefer.
+  servers:
+    - 8.8.8.8
+    - 8.8.4.4
+
+  # How long to wait for one public resolver.
+  timeout: 2s
+
+  # How often fallback usage is written to the log.
+  #
+  # Fallback is never logged per query: an outage generates one line per lookup
+  # for every device on the network, which is a log nobody can read. Instead
+  # usage is accumulated and reported as a single summary — query counts, how
+  # many outages, how long they lasted, and whether one is still in progress.
+  # Quiet periods log nothing at all, and a pending summary is flushed on
+  # shutdown so a restart does not lose it.
+  summary_interval: 24h
+
 admin:
   # HTTP endpoint serving /healthz, /status, and /metrics. Set to "" to
   # disable. Keep it on loopback unless you want it reachable from the LAN.

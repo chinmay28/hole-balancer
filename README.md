@@ -29,6 +29,10 @@ the client and the Pi-hole intended.
 - **Never black-holes DNS.** If the balancer believes *every* upstream is down,
   it tries them anyway rather than failing the network — a stale health verdict
   is a worse outcome than a wasted round trip.
+- **Falls back to public DNS.** When no Pi-hole can answer at all, queries go to
+  Google's resolvers (or whichever you configure) so the network keeps working
+  through a total outage. Usage is reported as one daily summary, never as a
+  line per query.
 - **Reports what it is doing.** JSON status, Prometheus metrics, and a plain
   text summary you can `curl`.
 
@@ -148,6 +152,75 @@ Set `health.probe.require_answer: true` if you want the stricter check — it
 additionally proves the Pi-hole's own upstream resolver is working, at the cost
 of a false outage if the probe name is ever blocked.
 
+### When every Pi-hole is down
+
+If no Pi-hole can answer — all of them rebooting, a switch down, a power cut —
+the balancer sends the query to a public resolver rather than failing it:
+
+```yaml
+fallback:
+  enabled: true            # on by default
+  servers:
+    - 8.8.8.8
+    - 8.8.4.4
+  timeout: 2s
+  summary_interval: 24h
+```
+
+**These answers are not filtered.** A public resolver knows nothing about your
+blocklists, so while fallback is carrying traffic, ads are not blocked. That is
+the trade, and it is deliberate: a house where nothing resolves is a worse
+failure than a house that briefly sees ads. Set `enabled: false` if you would
+rather DNS fail than go unfiltered.
+
+Three things keep this honest:
+
+- It only ever runs after every Pi-hole attempt has failed. While any Pi-hole
+  answers, no query reaches a public resolver — verified by a test.
+- Blocked domains never trigger it. Pi-hole reports a block as `NXDOMAIN` or an
+  answer, both of which are success, so the query never falls through.
+- Once the pool is known to be fully down, the balancer spends a single attempt
+  confirming that before going to public DNS, instead of burning the whole
+  retry budget on every query. One attempt still catches a Pi-hole that
+  recovered before the health checker noticed.
+
+Resolvers are tried in rotation, so a long outage spreads across them.
+
+### Knowing when it happened
+
+Fallback is never logged per query — an hour-long outage would be tens of
+thousands of identical lines. Instead usage accumulates and is written once per
+`summary_interval` (daily by default):
+
+```
+level=WARN msg="public DNS fallback was used: these queries were NOT filtered by Pi-hole"
+  window=24h0m0s since=2026-07-28T00:00:00Z queries=18432 failed=3
+  resolvers="8.8.8.8:53=9310 8.8.4.4:53=9119"
+  outages=2 outage_total=41m18s outage_longest=38m2s still_down=false
+```
+
+- A day with no fallback logs **nothing at all**, so a line appearing is itself
+  the signal.
+- An outage still in progress is reported as `still_down=true` with the time so
+  far, and continues into the next window without being double-counted.
+- A pending summary is flushed on shutdown, so a restart never loses it.
+
+Per-Pi-hole outages are still logged as they happen (`endpoint state changed`),
+so the daily summary is about *unfiltered answers*, not about losing one
+server. Live state is on the admin interface at any time:
+
+```bash
+curl -s localhost:8053/status | jq .fallback
+{
+  "enabled": true,
+  "active": false,
+  "servers": ["8.8.8.8:53", "8.8.4.4:53"],
+  "window_start": "2026-07-29T00:00:00Z",
+  "queries_this_window": 0,
+  "outages_this_window": 0
+}
+```
+
 ### Retries and your blocklists
 
 When an upstream returns one of `query.retry_rcodes` (`SERVFAIL`, `REFUSED` by
@@ -264,6 +337,8 @@ unless your network is one you trust.
 | Metric | Meaning |
 |---|---|
 | `holebalancer_upstream_up` | 0 when a Pi-hole has no working path |
+| `holebalancer_fallback_active` | 1 while answers are coming from public DNS, unfiltered |
+| `holebalancer_fallback_responses_total` | Queries served by a public resolver |
 | `holebalancer_servfail_total` | Queries no upstream could answer — should stay flat |
 | `holebalancer_retries_total` | Rising means an upstream is flaky |
 | `holebalancer_query_duration_seconds` | End-to-end latency, including retries |
@@ -271,7 +346,9 @@ unless your network is one you trust.
 | `holebalancer_responses_total` | Answers by upstream and response code |
 
 A reasonable first alert is `holebalancer_upstream_up == 0` for any upstream,
-plus `rate(holebalancer_servfail_total[5m]) > 0`.
+plus `rate(holebalancer_servfail_total[5m]) > 0`. If you care about blocking
+staying on, alert on `holebalancer_fallback_active == 1` as well — that gauge
+is high exactly when nothing is being filtered.
 
 ---
 
@@ -290,7 +367,9 @@ plus `rate(holebalancer_servfail_total[5m]) > 0`.
    network error, or a retryable response code moves on to the next entry, up to
    `query.max_attempts`.
 5. Every outcome updates that endpoint's health counters and latency average.
-6. If every attempt fails, the client gets `SERVFAIL` rather than silence.
+6. If every attempt fails and fallback is enabled, the query goes to a public
+   resolver, and the fact is counted for the next summary.
+7. If that fails too, the client gets `SERVFAIL` rather than silence.
 
 A retry moves to a *different Pi-hole* before it falls back to a second path to
 the same one: if a host is down, another route to it will not help.
@@ -310,6 +389,9 @@ make dist        # cross-compile for linux/amd64, arm64, arm, and darwin/arm64
 The tests run real DNS servers on loopback (`internal/testdns`) and drive the
 balancer through its actual sockets, including the failure cases: dropped
 queries, `SERVFAIL` storms, slow upstreams, and every upstream dying at once.
+The fallback tests point at fake resolvers and the summary tests drive an
+injected clock, so nothing in the suite touches the real 8.8.8.8 or waits a day
+to check a daily report.
 
 Layout:
 
@@ -320,6 +402,7 @@ Layout:
 | `internal/config` | Loading and validating YAML |
 | `internal/pool` | Upstreams, endpoints, health state, and selection |
 | `internal/health` | Active probing |
+| `internal/fallback` | Public-DNS last resort and its daily usage summary |
 | `internal/proxy` | Listeners and the forwarding path |
 | `internal/admin` | Status, metrics, and drain endpoints |
 | `internal/metrics` | Counters, histograms, Prometheus rendering |

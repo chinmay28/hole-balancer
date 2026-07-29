@@ -52,6 +52,7 @@ type Config struct {
 	Strategy  string     `yaml:"strategy"`
 	Query     Query      `yaml:"query"`
 	Health    Health     `yaml:"health"`
+	Fallback  Fallback   `yaml:"fallback"`
 	Admin     Admin      `yaml:"admin"`
 	Log       Log        `yaml:"log"`
 	Upstreams []Upstream `yaml:"upstreams"`
@@ -119,6 +120,24 @@ func (p *Probe) QType() uint16 { return p.qtype }
 // dead upstream far sooner than the probe interval alone.
 type Passive struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// Fallback is the last line of defence: public resolvers used only when no
+// Pi-hole can answer a query.
+//
+// These queries are NOT filtered — a public resolver knows nothing about your
+// blocklists — so this trades ad blocking for the network staying usable
+// during a total Pi-hole outage. Set enabled to false if you would rather DNS
+// fail than go unfiltered.
+type Fallback struct {
+	Enabled bool     `yaml:"enabled"`
+	Servers []string `yaml:"servers"`
+	// Timeout bounds one attempt against one public resolver.
+	Timeout Duration `yaml:"timeout"`
+	// SummaryInterval is how often the accumulated fallback usage is written
+	// to the log. Fallback is never logged per query: during an outage that
+	// would be thousands of identical lines.
+	SummaryInterval Duration `yaml:"summary_interval"`
 }
 
 // Admin configures the HTTP status, metrics, and control endpoints.
@@ -207,6 +226,12 @@ func Default() Config {
 			},
 			Passive: Passive{Enabled: true},
 		},
+		Fallback: Fallback{
+			Enabled:         true,
+			Servers:         []string{"8.8.8.8", "8.8.4.4"},
+			Timeout:         Duration(2 * time.Second),
+			SummaryInterval: Duration(24 * time.Hour),
+		},
 		Admin: Admin{Listen: "127.0.0.1:8053"},
 		Log:   Log{Level: "info"},
 	}
@@ -293,6 +318,30 @@ func (c *Config) Validate() error {
 	}
 	if !strings.HasSuffix(c.Health.Probe.Name, ".") {
 		c.Health.Probe.Name += "."
+	}
+
+	if c.Fallback.Enabled {
+		if len(c.Fallback.Servers) == 0 {
+			return fmt.Errorf("fallback.servers must list at least one resolver when fallback is enabled")
+		}
+		if c.Fallback.Timeout <= 0 {
+			return fmt.Errorf("fallback.timeout must be positive")
+		}
+		if c.Fallback.SummaryInterval <= 0 {
+			return fmt.Errorf("fallback.summary_interval must be positive")
+		}
+		seen := make(map[string]bool, len(c.Fallback.Servers))
+		for i, raw := range c.Fallback.Servers {
+			addr, err := normaliseAddr(raw)
+			if err != nil {
+				return fmt.Errorf("fallback.servers[%d]: %w", i, err)
+			}
+			if seen[addr] {
+				return fmt.Errorf("fallback.servers: duplicate resolver %s", addr)
+			}
+			seen[addr] = true
+			c.Fallback.Servers[i] = addr
+		}
 	}
 
 	if !contains([]string{"debug", "info", "warn", "error"}, c.Log.Level) {

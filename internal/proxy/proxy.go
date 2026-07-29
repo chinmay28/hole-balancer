@@ -12,16 +12,18 @@ import (
 	"github.com/chinmay28/hole-balancer/internal/config"
 	"github.com/chinmay28/hole-balancer/internal/dnsclient"
 	"github.com/chinmay28/hole-balancer/internal/dnsmsg"
+	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
 )
 
 // Server forwards client queries to upstream Pi-holes.
 type Server struct {
-	cfg     *config.Config
-	pool    *pool.Pool
-	metrics *metrics.Metrics
-	log     *slog.Logger
+	cfg      *config.Config
+	pool     *pool.Pool
+	metrics  *metrics.Metrics
+	log      *slog.Logger
+	fallback *fallback.Resolver
 
 	// sem bounds queries in flight across both transports.
 	sem chan struct{}
@@ -34,15 +36,21 @@ type Server struct {
 	tcpAddr string
 }
 
-// New creates a forwarding server.
-func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, log *slog.Logger) *Server {
+// outageProbeAttempts is how many Pi-hole endpoints are tried during a total
+// outage before the query goes to public DNS.
+const outageProbeAttempts = 1
+
+// New creates a forwarding server. A nil fallback resolver simply means no
+// public-DNS last resort.
+func New(cfg *config.Config, p *pool.Pool, m *metrics.Metrics, fb *fallback.Resolver, log *slog.Logger) *Server {
 	return &Server{
-		cfg:     cfg,
-		pool:    p,
-		metrics: m,
-		log:     log,
-		sem:     make(chan struct{}, cfg.Query.MaxConcurrent),
-		ready:   make(chan struct{}),
+		cfg:      cfg,
+		pool:     p,
+		metrics:  m,
+		log:      log,
+		fallback: fb,
+		sem:      make(chan struct{}, cfg.Query.MaxConcurrent),
+		ready:    make(chan struct{}),
 	}
 }
 
@@ -104,15 +112,17 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 	question, qErr := dnsmsg.ParseQuestion(req)
 
 	plan := s.pool.Plan()
-	if len(plan) == 0 {
-		s.log.Error("no upstreams configured to answer query")
-		s.metrics.Servfails.Inc()
-		return dnsmsg.ErrorResponse(req, dnsmsg.RCodeServFail)
-	}
-
 	attempts := s.cfg.Query.MaxAttempts
 	if attempts > len(plan) {
 		attempts = len(plan)
+	}
+
+	// When every Pi-hole is believed down, spend one attempt confirming that
+	// belief is still current — health can be stale — and then hand the query
+	// to public DNS. Burning the full retry budget first would add seconds of
+	// latency to every query for as long as the outage lasts.
+	if s.fallback.Enabled() && s.pool.HealthyUpstreams() == 0 && attempts > outageProbeAttempts {
+		attempts = outageProbeAttempts
 	}
 
 	var (
@@ -185,6 +195,10 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 		return resp
 	}
 
+	if resp := s.resolveViaFallback(ctx, req, proto, question, qErr); resp != nil {
+		return resp
+	}
+
 	s.metrics.Servfails.Inc()
 	s.log.Warn("query failed on every attempt",
 		"question", questionField(question, qErr),
@@ -200,6 +214,36 @@ func (s *Server) forward(ctx context.Context, req []byte, proto string) []byte {
 		return lastResp
 	}
 	return dnsmsg.ErrorResponse(req, dnsmsg.RCodeServFail)
+}
+
+// resolveViaFallback hands a query the Pi-holes could not answer to public
+// DNS. It returns nil when fallback is disabled or itself fails.
+//
+// Nothing is logged per query here: during an outage that would be one line
+// per lookup for every device on the network. Usage is accumulated by the
+// tracker and reported once per summary interval instead.
+func (s *Server) resolveViaFallback(ctx context.Context, req []byte, proto string, question dnsmsg.Question, qErr error) []byte {
+	if !s.fallback.Enabled() {
+		return nil
+	}
+
+	resp, server, err := s.fallback.Resolve(ctx, req, proto)
+	if err != nil {
+		s.log.Debug("public DNS fallback failed",
+			"question", questionField(question, qErr), "error", err)
+		return nil
+	}
+
+	if s.cfg.Log.Queries {
+		respHdr, _ := dnsmsg.ParseHeader(resp)
+		s.log.Info("query answered by public DNS fallback (unfiltered)",
+			"question", questionField(question, qErr),
+			"proto", proto,
+			"resolver", server,
+			"rcode", respHdr.RCode.String(),
+		)
+	}
+	return resp
 }
 
 func questionField(q dnsmsg.Question, err error) string {

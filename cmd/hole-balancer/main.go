@@ -22,6 +22,7 @@ import (
 
 	"github.com/chinmay28/hole-balancer/internal/admin"
 	"github.com/chinmay28/hole-balancer/internal/config"
+	"github.com/chinmay28/hole-balancer/internal/fallback"
 	"github.com/chinmay28/hole-balancer/internal/health"
 	"github.com/chinmay28/hole-balancer/internal/metrics"
 	"github.com/chinmay28/hole-balancer/internal/pool"
@@ -76,7 +77,12 @@ func run() error {
 		"config", *configPath)
 
 	m := metrics.New()
-	p := pool.New(cfg, func(e *pool.Endpoint, up bool, reason string) {
+	fbTracker := fallback.NewTracker(cfg, log)
+
+	// p is referenced from the callback it is constructed with. That is safe:
+	// the callback only fires from health reporting, which starts below.
+	var p *pool.Pool
+	p = pool.New(cfg, func(e *pool.Endpoint, up bool, reason string) {
 		state := "down"
 		level := slog.LevelWarn
 		if up {
@@ -89,7 +95,12 @@ func run() error {
 			metrics.Label{Name: "endpoint", Value: e.Name},
 			metrics.Label{Name: "state", Value: state},
 		)
+		// An endpoint flip is the fastest signal that the last Pi-hole just
+		// went away, or that the first one came back.
+		fbTracker.Observe(p.HealthyUpstreams() == 0)
 	})
+
+	fbResolver := fallback.NewResolver(cfg, fbTracker, m, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -97,10 +108,24 @@ func run() error {
 	// Learn the state of the pool before opening the listeners, so the first
 	// client query is routed on fact rather than on an assumption.
 	checker := health.New(cfg, p, m, log)
+	// Catches pool-wide changes no single endpoint reports, such as an
+	// upstream drained by hand through the admin interface.
+	checker.OnSweep = func() { fbTracker.Observe(p.HealthyUpstreams() == 0) }
 	checker.Bootstrap(ctx)
 	if p.HealthyUpstreams() == 0 {
-		log.Warn("no upstream answered the initial probe; serving anyway and will retry every interval",
-			"interval", cfg.Health.Interval.String())
+		if fbResolver.Enabled() {
+			log.Warn("no upstream answered the initial probe; serving from public DNS until one returns",
+				"resolvers", strings.Join(fbResolver.Servers(), ", "),
+				"interval", cfg.Health.Interval.String())
+		} else {
+			log.Warn("no upstream answered the initial probe; serving anyway and will retry every interval",
+				"interval", cfg.Health.Interval.String())
+		}
+	}
+	if fbResolver.Enabled() {
+		log.Info("public DNS fallback armed",
+			"resolvers", strings.Join(fbResolver.Servers(), ", "),
+			"summary_interval", cfg.Fallback.SummaryInterval.String())
 	}
 
 	var (
@@ -126,14 +151,22 @@ func run() error {
 		checker.Run(ctx)
 	}()
 
-	adminSrv := admin.New(cfg, p, m, log, buildVersion())
+	// Reports accumulated fallback usage on its interval, and once more on
+	// shutdown so a short run still accounts for what it served.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fbTracker.Run(ctx)
+	}()
+
+	adminSrv := admin.New(cfg, p, m, fbTracker, log, buildVersion())
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		fail(adminSrv.ListenAndServe(ctx))
 	}()
 
-	dnsSrv := proxy.New(cfg, p, m, log)
+	dnsSrv := proxy.New(cfg, p, m, fbResolver, log)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
