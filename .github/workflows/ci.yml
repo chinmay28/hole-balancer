@@ -53,6 +53,20 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Install script stages cleanly and never clobbers a config
+        run: |
+          make build
+          DESTDIR=/tmp/stage ./deploy/install.sh
+          test -x /tmp/stage/usr/local/bin/hole-balancer
+          test -f /tmp/stage/etc/systemd/system/hole-balancer.service
+          test -f /tmp/stage/etc/hole-balancer/config.yaml
+          # The config must survive a second run: upgrading must not discard it.
+          echo "# sentinel" >> /tmp/stage/etc/hole-balancer/config.yaml
+          DESTDIR=/tmp/stage ./deploy/install.sh
+          grep -q "# sentinel" /tmp/stage/etc/hole-balancer/config.yaml
+          # The unit must keep the one writable path the dashboard needs.
+          grep -q "ReadWritePaths=/etc/hole-balancer" /tmp/stage/etc/systemd/system/hole-balancer.service
+
   cross-compile:
     runs-on: ubuntu-latest
     strategy:

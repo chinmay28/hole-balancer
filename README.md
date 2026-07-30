@@ -260,15 +260,36 @@ shared config) if you want deterministic blocking.
 ### systemd
 
 ```bash
-sudo make install
+sudo make install                       # or: sudo make install CONFIG=config.yaml
 sudo $EDITOR /etc/hole-balancer/config.yaml
 sudo systemctl enable --now hole-balancer
 journalctl -u hole-balancer -f
 ```
 
-The bundled unit runs the balancer as a transient unprivileged user with
-`CAP_NET_BIND_SERVICE`, so it binds port 53 without ever being root, and with a
-tight sandbox (read-only filesystem, no new privileges, restricted syscalls).
+`make install` creates a `hole-balancer` system account, installs the binary and
+unit, and grants `CAP_NET_BIND_SERVICE` so port 53 is bound without ever running
+as root. The unit is otherwise tightly sandboxed: read-only filesystem, no new
+privileges, restricted syscalls and address families.
+
+It is safe to re-run. An existing `/etc/hole-balancer/config.yaml` is never
+overwritten, so upgrading is `git pull && sudo make install` and nothing you
+changed — by hand or from the dashboard — is lost. Pass `CONFIG=path` to seed
+the config on a first install. `make uninstall` removes the service, binary, and
+account, and deliberately leaves the configuration in place.
+
+Two details worth knowing if you edit the unit:
+
+- **`ReadWritePaths=/etc/hole-balancer` is load-bearing.** `ProtectSystem=strict`
+  makes the whole filesystem read-only, which would leave the dashboard applying
+  changes and then failing to save them. Removing that line silently breaks
+  `admin.allow_control`.
+- **The account is fixed rather than `DynamicUser=yes`.** A transient account
+  gets a different UID on each start, so it could not own the config file it has
+  to rewrite.
+
+Packaging it yourself? `deploy/install.sh` honours `DESTDIR`, `PREFIX`,
+`BINDIR`, `SYSCONFDIR`, and `UNITDIR`, and skips the account, capability, and
+`daemon-reload` steps when staging into a build root.
 
 If some upstreams are only reachable over Tailscale, uncomment the
 `After=tailscaled.service` line so the startup health sweep can see them.

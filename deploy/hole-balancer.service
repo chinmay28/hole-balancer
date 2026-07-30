@@ -13,15 +13,27 @@ ExecStart=/usr/local/bin/hole-balancer -config /etc/hole-balancer/config.yaml
 Restart=on-failure
 RestartSec=2s
 
-# Bind port 53 without running as root. DynamicUser gives the service a
-# transient unprivileged account that exists only while it runs.
-DynamicUser=yes
+# Bind port 53 without running as root. The account is created by
+# deploy/install.sh and owns /etc/hole-balancer.
+#
+# A fixed user rather than DynamicUser=yes: the management interface writes
+# configuration changes back to that directory, and a transient account gets a
+# different UID on each start, so it could not own the file it has to rewrite.
+User=hole-balancer
+Group=hole-balancer
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # The balancer opens sockets and reads one config file. Nothing else.
 NoNewPrivileges=yes
 ProtectSystem=strict
+
+# ProtectSystem=strict makes the whole filesystem read-only, which would stop
+# the management interface saving anything — the "add a Pi-hole" button would
+# apply the change and then fail to persist it. This is the one exception.
+# Removing it silently breaks admin.allow_control; leave it in place.
+ReadWritePaths=/etc/hole-balancer
+
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
