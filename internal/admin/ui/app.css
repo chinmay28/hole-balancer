@@ -149,8 +149,8 @@ main {
 
 .logo {
   width: 28px; height: 28px; flex: none;
-  border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, transparent 0 34%, var(--series-1) 35% 100%);
+  border-radius: 7px; /* matches the icon's own corner radius */
+  display: block;
 }
 
 h1 { font-size: 18px; font-weight: 640; margin: 0; letter-spacing: -0.01em; }
@@ -512,6 +512,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .foot a { color: var(--text-secondary); }
 .foot-links { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.foot-by { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.foot-by > a {
+  display: inline-flex; align-items: center; gap: 6px;
+  text-decoration: none; font-weight: 560;
+}
+.foot-by > a:hover { color: var(--text-primary); }
+.foot-by > a:hover .dev-mark { opacity: 1; }
+/* Inherits the link's colour through currentColor, in either theme. */
+.dev-mark { width: 15px; height: 15px; flex: none; opacity: 0.8; }
+.foot-sep:not(:empty)::before { content: "·"; margin-right: 8px; color: var(--text-muted); }
 
 .empty { color: var(--text-muted); font-size: 13px; padding: 12px 0; }
 

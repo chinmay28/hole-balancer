@@ -264,12 +264,27 @@ func TestUIIsSelfContained(t *testing.T) {
 	}
 
 	// The page must load on a network whose DNS is broken, so nothing may be
-	// fetched from anywhere else.
-	for _, forbidden := range []string{"http://", "https://", "//cdn", "src=\"/"} {
-		// The favicon and the SVG namespace are data/identifier URLs, not fetches.
-		cleaned := strings.ReplaceAll(body, "http://www.w3.org/2000/svg", "")
-		if strings.Contains(cleaned, forbidden) {
-			t.Errorf("page references %q — it must be fully self-contained", forbidden)
+	// *fetched* from anywhere else. A hyperlink to an off-origin page is fine —
+	// following it is the reader's choice and happens after the page has
+	// loaded — so this checks resource positions specifically rather than
+	// matching "https://" anywhere in the document.
+	for _, forbidden := range []string{
+		`src="http`, `src='http`, `src="//`, // scripts, images, frames
+		`url(http`, `url("http`, `url(//`, // stylesheet references
+		"@import", // ditto
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("page fetches %q — it must load with no network at all", forbidden)
+		}
+	}
+	// <link> is a fetch too, so its href has to be same-origin.
+	for _, tag := range strings.Split(body, "<link ")[1:] {
+		head := tag
+		if i := strings.Index(head, ">"); i >= 0 {
+			head = head[:i]
+		}
+		if strings.Contains(head, "href=\"http") || strings.Contains(head, "href=\"//") {
+			t.Errorf("page links an off-origin resource: <link %s>", head)
 		}
 	}
 	for _, want := range []string{"<style>", "<script>", "hole-balancer", "/api/overview"} {
@@ -321,5 +336,59 @@ func TestUIIsMobileReady(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("stylesheet is missing %q", want)
 		}
+	}
+}
+
+func TestIconIsServedAndCacheable(t *testing.T) {
+	s, _ := newTestAdmin(t, true)
+
+	rec := send(t, s, http.MethodGet, "/icon.svg", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "image/svg+xml" {
+		t.Errorf("content type = %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "<svg") {
+		t.Error("body is not an SVG")
+	}
+
+	// A content-hash ETag lets a browser revalidate cheaply while a new build
+	// invalidates on its own, with no cache-busting query string to maintain.
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag")
+	}
+	r := httptest.NewRequest(http.MethodGet, "/icon.svg", nil)
+	r.Header.Set("If-None-Match", etag)
+	again := httptest.NewRecorder()
+	s.Handler().ServeHTTP(again, r)
+	if again.Code != http.StatusNotModified {
+		t.Errorf("revalidation returned %d, want 304", again.Code)
+	}
+}
+
+func TestPageCarriesBothMarks(t *testing.T) {
+	s, _ := newTestAdmin(t, true)
+	body := send(t, s, http.MethodGet, "/", "").Body.String()
+
+	// The icon is linked, so the browser caches one copy for the tab and the
+	// header.
+	for _, want := range []string{`rel="icon"`, `href="icon.svg"`, `src="icon.svg"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page is missing %q", want)
+		}
+	}
+
+	// The author's mark is inlined, which is the only way its currentColor
+	// strokes can take the footer's text colour in both themes.
+	if strings.Contains(body, "<!--DEV_MARK-->") {
+		t.Error("the DEV_MARK placeholder was not substituted")
+	}
+	if !strings.Contains(body, `stroke="currentColor"`) {
+		t.Error("the author's mark is not inlined into the page")
+	}
+	if !strings.Contains(body, "chinmay28") {
+		t.Error("the footer credit is missing")
 	}
 }

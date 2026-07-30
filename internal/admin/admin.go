@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chinmay28/hole-balancer/assets"
 	"github.com/chinmay28/hole-balancer/internal/config"
 	"github.com/chinmay28/hole-balancer/internal/control"
 	"github.com/chinmay28/hole-balancer/internal/fallback"
@@ -81,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /summary", s.handleIndex)
 	mux.HandleFunc("GET /{$}", s.handleUI)
+	mux.HandleFunc("GET /icon.svg", handleAsset(assets.Icon))
 	s.apiRoutes(mux)
 	if s.cfg.Admin.AllowControl {
 		mux.HandleFunc("POST /drain", s.handleDrain(true))
