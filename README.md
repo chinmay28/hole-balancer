@@ -59,14 +59,13 @@ Pi-hole intended.
 ## Quick start
 
 ```bash
-git clone https://github.com/chinmay28/hole-balancer
-cd hole-balancer
-./quickstart.sh 192.168.1.10 192.168.1.11
+curl -fsSL https://raw.githubusercontent.com/chinmay28/hole-balancer/main/quickstart.sh | bash -s -- 192.168.1.10 192.168.1.11
 ```
 
-That builds it, writes a config, and starts on a high port with the dashboard at
-<http://127.0.0.1:8053/>. See [QUICKSTART.md](QUICKSTART.md) for the guided
-version and how to make it permanent.
+One command: fetches, builds, writes a config, and starts on a high port with
+the dashboard at <http://127.0.0.1:8053/>. Add `--install` (and `sudo`) to put it
+on port 53 as a systemd service instead. See [QUICKSTART.md](QUICKSTART.md),
+including how to read the script first if you would rather not pipe it.
 
 Or do it by hand:
 

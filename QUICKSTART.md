@@ -6,26 +6,30 @@ minute. You need [Go](https://go.dev/dl/) and at least one Pi-hole.
 ## One command
 
 ```bash
-git clone https://github.com/chinmay28/hole-balancer
-cd hole-balancer
-./quickstart.sh
+curl -fsSL https://raw.githubusercontent.com/chinmay28/hole-balancer/main/quickstart.sh | bash -s -- 192.168.1.10 192.168.1.11
 ```
 
-It asks which Pi-holes to balance across, builds the binary, writes a
-`config.yaml`, and starts up. Or skip the questions:
+Put your own Pi-hole addresses on the end. That fetches the source, builds it,
+writes a `config.yaml`, and starts up. Leave the addresses off and it asks.
+
+Prefer to read it before running it — always a reasonable instinct with a piped
+script:
 
 ```bash
-./quickstart.sh 192.168.1.10 192.168.1.11
+curl -fsSL https://raw.githubusercontent.com/chinmay28/hole-balancer/main/quickstart.sh -o quickstart.sh
+less quickstart.sh
+bash quickstart.sh 192.168.1.10 192.168.1.11
 ```
 
-That's it. Two things are now listening:
+Either way, two things are now listening:
 
 | | |
 |---|---|
 | **DNS** | `127.0.0.1:5300` — udp and tcp |
 | **Web** | <http://127.0.0.1:8053/> |
 
-A high port is used so nothing needs root yet. Check it works:
+A high port is used so nothing needs root yet, and the source ends up in
+`./hole-balancer`. Check it works:
 
 ```bash
 dig @127.0.0.1 -p 5300 example.com
@@ -37,11 +41,11 @@ file.
 
 ### A Pi-hole on two networks
 
-If a Pi-hole answers on both your LAN and Tailscale, give both addresses on one
-line, separated by a space:
+If a Pi-hole answers on both your LAN and Tailscale, give both addresses as one
+argument, separated by a space:
 
 ```bash
-./quickstart.sh "192.168.1.10 100.101.102.103" "192.168.1.11 100.101.102.104"
+... | bash -s -- "192.168.1.10 100.101.102.103" "192.168.1.11 100.101.102.104"
 ```
 
 That records two machines with two routes each — not four machines. It matters:
@@ -51,8 +55,13 @@ each Pi-hole still gets its fair one-in-two share of the traffic.
 ### Different ports
 
 ```bash
-PORT=5301 ADMIN_PORT=8054 ./quickstart.sh 192.168.1.10
+curl -fsSL .../quickstart.sh | PORT=5301 ADMIN_PORT=8054 bash -s -- 192.168.1.10
 ```
+
+### Already have a checkout?
+
+`./quickstart.sh` does the same thing without cloning — it notices it is already
+inside the source tree.
 
 ---
 
@@ -105,17 +114,21 @@ survives a restart. A copy of the previous file is kept as `config.yaml.bak`.
 
 ## Making it permanent
 
-Once you are happy with the setup:
+Also one command — add `--install`:
 
-**1. Move it to port 53.** Edit `config.yaml`:
-
-```yaml
-listen:
-  udp: ":53"
-  tcp: ":53"
+```bash
+curl -fsSL https://raw.githubusercontent.com/chinmay28/hole-balancer/main/quickstart.sh | sudo bash -s -- --install 192.168.1.10 192.168.1.11
 ```
 
-**2. Install it as a service,** keeping the config you just tuned:
+That puts it on port 53 as a systemd service, enabled at boot. If you already
+tried it in the foreground, re-run from the checkout to keep the config you
+tuned:
+
+```bash
+cd hole-balancer && sudo ./quickstart.sh --install
+```
+
+Either way it ends up equivalent to:
 
 ```bash
 sudo make install CONFIG=config.yaml
@@ -137,7 +150,7 @@ The dashboard stays editable under systemd: the unit grants write access to
 `/etc/hole-balancer` specifically, since the rest of the filesystem is read-only
 to the service.
 
-**3. Point your network at it.** Set your router's DHCP "DNS server" option to
+**Then point your network at it.** Set your router's DHCP "DNS server" option to
 the balancer's address, and the whole house moves over as leases renew.
 
 > Don't point the balancer at itself. If it shares a host with a Pi-hole, keep
