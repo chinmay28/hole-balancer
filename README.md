@@ -1,3 +1,5 @@
+<img src="assets/icon.svg" alt="" width="72" height="72">
+
 # hole-balancer
 
 A DNS load balancer for a pool of Pi-hole servers.

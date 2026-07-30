@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="dev-mark" aria-hidden="true" focusable="false">
+  <!--
+    The author's mark, shown beside their name in the footer.
+
+    Geometry only — no embedded text. An SVG that renders a letter depends on a
+    font being present, and this has to look the same in a browser, in a README
+    on GitHub, and at 16px. Drawing the C as an arc sidesteps that.
+
+    Strokes use currentColor so the mark takes the colour of the text it sits
+    next to, in either theme, with nothing to keep in sync. That only works when
+    the SVG is part of the page, so this file is inlined into the dashboard at
+    assembly time rather than loaded with <img> — an <img>-loaded SVG is an
+    isolated document and currentColor would resolve to plain black, invisible
+    against the dark theme.
+  -->
+  <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+    <rect x="1.75" y="1.75" width="12.5" height="12.5" rx="3.75"/>
+    <path d="M10.3 5.7a3.1 3.1 0 1 0 0 4.6"/>
+  </g>
+</svg>

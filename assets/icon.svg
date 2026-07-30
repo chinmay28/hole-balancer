@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="hole-balancer">
+  <title>hole-balancer</title>
+  <!--
+    One query arriving on the left, fanned out to three Pi-holes on the right:
+    the load-balancer glyph, which is what this thing is.
+
+    Deliberately a filled badge with a white glyph rather than a bare mark. A
+    favicon sits on whatever colour the browser's tab strip happens to be, and
+    a badge reads on all of them; a thin blue mark disappears on half.
+    Filled dots rather than rings for the same reason — a 1px ring at 16px is
+    a grey smudge.
+  -->
+  <rect width="32" height="32" rx="7" fill="#2a78d6"/>
+  <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round">
+    <path d="M10.8 16h3.6a2.4 2.4 0 0 0 2.4-2.4v-1.4a2.4 2.4 0 0 1 2.4-2.4h1.6"/>
+    <path d="M10.8 16h10.4"/>
+    <path d="M10.8 16h3.6a2.4 2.4 0 0 1 2.4 2.4v1.4a2.4 2.4 0 0 0 2.4 2.4h1.6"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="8.4" cy="16" r="2.7"/>
+    <circle cx="23.6" cy="9.8" r="2.5"/>
+    <circle cx="23.6" cy="16" r="2.5"/>
+    <circle cx="23.6" cy="22.2" r="2.5"/>
+  </g>
+</svg>

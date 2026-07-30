@@ -1,11 +1,14 @@
 package admin
 
 import (
+	"bytes"
 	_ "embed"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/chinmay28/hole-balancer/assets"
 )
 
 // The management interface is embedded in the binary. Nothing is fetched from
@@ -46,16 +49,39 @@ func init() {
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
 <title>hole-balancer</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232a78d6' stroke-width='6'/%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
 <style>
 `)
 	sb.WriteString(uiCSS)
 	sb.WriteString("\n</style>\n</head>\n<body>\n")
-	sb.WriteString(uiBody)
+	// The author's mark is inlined rather than linked so its currentColor
+	// strokes inherit the footer's text colour in both themes.
+	sb.WriteString(strings.Replace(uiBody, "<!--DEV_MARK-->", string(assets.DevMark), 1))
 	sb.WriteString("\n<script>\n")
 	sb.WriteString(uiJS)
 	sb.WriteString("\n</script>\n</body>\n</html>\n")
 	uiPage = []byte(sb.String())
+}
+
+// handleAsset serves one of the embedded artwork files.
+//
+// Both are immutable for the life of a build, so they carry a content hash as
+// their ETag: a browser revalidates cheaply on reload, and a new build
+// invalidates automatically without a cache-busting query string.
+func handleAsset(body []byte) http.HandlerFunc {
+	etag := assets.ETag(body)
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", assets.SVGContentType)
+		w.Header().Set("Cache-Control", "no-cache") // revalidate, do not blindly reuse
+		w.Header().Set("ETag", etag)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		http.ServeContent(w, r, "icon.svg", startupTime, bytes.NewReader(body))
+	}
 }
 
 // handleUI serves the management dashboard.
