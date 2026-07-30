@@ -2,7 +2,7 @@ BINARY  := hole-balancer
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test race lint vet fmt cover clean install run quickstart
+.PHONY: all build test race lint vet fmt cover clean install uninstall run quickstart
 
 all: fmt vet test build
 
@@ -35,12 +35,24 @@ dist: clean
 			-ldflags "$(LDFLAGS)" -o dist/$(BINARY)-$$os-$$arch ./cmd/hole-balancer; \
 	done
 
+# Install as a systemd service. Safe to re-run: an existing
+# /etc/hole-balancer/config.yaml is never overwritten, so upgrading is just
+# `git pull && sudo make install`.
+#
+# Pass CONFIG= to seed the config from a file you already have, which is what
+# you want straight after trying it with quickstart.sh:
+#   sudo make install CONFIG=config.yaml
 install: build
-	install -Dm755 $(BINARY) /usr/local/bin/$(BINARY)
-	install -Dm644 config.example.yaml /etc/hole-balancer/config.yaml
-	install -Dm644 deploy/hole-balancer.service /etc/systemd/system/hole-balancer.service
-	setcap cap_net_bind_service=+ep /usr/local/bin/$(BINARY)
-	@echo "Edit /etc/hole-balancer/config.yaml, then: systemctl enable --now hole-balancer"
+	@deploy/install.sh $(if $(CONFIG),--config $(CONFIG))
+
+# Removes the service, binary, and account. The configuration is deliberately
+# left behind — reinstalling should not mean rebuilding your pool by hand.
+uninstall:
+	-systemctl disable --now $(BINARY) 2>/dev/null
+	rm -f /etc/systemd/system/$(BINARY).service /usr/local/bin/$(BINARY)
+	-systemctl daemon-reload 2>/dev/null
+	-userdel $(BINARY) 2>/dev/null
+	@echo "Removed. Configuration left in /etc/hole-balancer/ — delete it by hand if you want it gone."
 
 # Run against config.yaml on high ports, no privileges needed.
 run: build

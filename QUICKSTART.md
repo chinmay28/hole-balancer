@@ -115,17 +115,27 @@ listen:
   tcp: ":53"
 ```
 
-**2. Install it as a service:**
+**2. Install it as a service,** keeping the config you just tuned:
 
 ```bash
-sudo make install
-sudo cp config.yaml /etc/hole-balancer/config.yaml
+sudo make install CONFIG=config.yaml
 sudo systemctl enable --now hole-balancer
 journalctl -u hole-balancer -f
 ```
 
-The bundled unit binds port 53 with `CAP_NET_BIND_SERVICE` rather than running
+That creates a `hole-balancer` system account, installs the binary and the unit,
+copies your config to `/etc/hole-balancer/config.yaml` owned by that account,
+and grants the binary `CAP_NET_BIND_SERVICE` so it binds port 53 without running
 as root.
+
+Upgrading later is `git pull && sudo make install` — an existing
+`/etc/hole-balancer/config.yaml` is never overwritten, so nothing you changed by
+hand or from the dashboard is lost. (`make uninstall` reverses it and leaves the
+config behind.)
+
+The dashboard stays editable under systemd: the unit grants write access to
+`/etc/hole-balancer` specifically, since the rest of the filesystem is read-only
+to the service.
 
 **3. Point your network at it.** Set your router's DHCP "DNS server" option to
 the balancer's address, and the whole house moves over as leases renew.

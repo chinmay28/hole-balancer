@@ -344,15 +344,23 @@ func (c *Config) Save(path string) error {
 		return err
 	}
 
+	// Carry the existing file's permissions across rather than imposing a mode
+	// of our own: a packaged install deliberately restricts this file to the
+	// service account, and a save must not quietly widen that.
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+
 	if prev, err := os.ReadFile(path); err == nil {
-		if err := os.WriteFile(path+".bak", prev, 0o600); err != nil {
+		if err := os.WriteFile(path+".bak", prev, mode); err != nil {
 			return fmt.Errorf("writing backup: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("reading existing config: %w", err)
 	}
 
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, mode); err != nil {
 		return err
 	}
 	return os.Rename(tmpName, path)

@@ -429,3 +429,60 @@ func TestNormaliseAddrIsExported(t *testing.T) {
 		t.Errorf("NormaliseAddr = %q, %v", got, err)
 	}
 }
+
+// A packaged install restricts the config file to the service account. A save
+// must carry that across rather than imposing a mode of its own, or the first
+// change made from the dashboard would quietly widen the file to world-readable.
+func TestSavePreservesFilePermissions(t *testing.T) {
+	cfg, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Strategy = StrategyFailover
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Errorf("mode after save = %04o, want 0640 kept", got)
+	}
+	// The backup holds the same content, so it must not be laxer either.
+	bak, err := os.Stat(path + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bak.Mode().Perm(); got != 0o640 {
+		t.Errorf("backup mode = %04o, want 0640", got)
+	}
+}
+
+func TestSaveUsesASensibleModeForANewFile(t *testing.T) {
+	cfg, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Errorf("new file mode = %04o, want 0644", got)
+	}
+}
