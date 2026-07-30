@@ -38,17 +38,36 @@ jobs:
         run: |
           go run ./cmd/hole-balancer -validate -config config.example.yaml
 
-      - name: Quick start builds and produces a valid config
+      # Two ways in, both have to work: from inside a checkout, and piped from
+      # curl into a bare shell with nothing on disk.
+      - name: Quick start, in-tree
         run: |
-          PORT=5399 ADMIN_PORT=8099 timeout 90 ./quickstart.sh 127.0.0.1:5301 &
+          PORT=5399 ADMIN_PORT=8099 timeout 120 ./quickstart.sh 127.0.0.1:5301 &
           qs=$!
-          for i in $(seq 1 40); do
-            if curl -sf http://127.0.0.1:8099/api/overview >/dev/null; then break; fi
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8099/api/overview >/dev/null && break
             sleep 1
           done
           curl -sf http://127.0.0.1:8099/ | grep -q "hole-balancer"
           curl -sf http://127.0.0.1:8099/api/stats >/dev/null
+          test ! -d hole-balancer   # must not clone when already in the tree
           kill $qs 2>/dev/null || true
+
+      - name: Quick start, piped from a bare shell
+        run: |
+          mkdir -p /tmp/bare && cd /tmp/bare
+          cat "$GITHUB_WORKSPACE/quickstart.sh" |             REPO_URL="file://$GITHUB_WORKSPACE" BRANCH=             PORT=5398 ADMIN_PORT=8098 timeout 120 bash -s -- 127.0.0.1:5301 &
+          qs=$!
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8098/api/overview >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8098/ | grep -q "hole-balancer"
+          test -f /tmp/bare/hole-balancer/config.yaml   # it bootstrapped itself
+          kill $qs 2>/dev/null || true
+
+      - name: Quick start help works when piped
+        run: cat quickstart.sh | bash -s -- --help | grep -q -- --install
 
       - name: Build
         run: go build ./...
